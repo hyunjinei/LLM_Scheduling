@@ -72,6 +72,17 @@
   2. end-to-end direct solving
   3. scheduling / makespan relevance
 
+전수 검토를 위해 별도 카탈로그도 생성했다.
+- `literature_review/llm_for_co_catalog.json`
+- `literature_review/llm_for_co_catalog.csv`
+
+현재 자동 수집 기준 커버리지는 다음과 같다.
+- abstract 수집 성공: **131 / 157**
+- method snippet 수집 성공: **129 / 157**
+- 둘 다 수집 성공: **128 / 157**
+
+실패의 대부분은 OpenReview 원문 접근 제한(`403 Forbidden`) 때문이다. 따라서 아래 비교표는 **전체 목록 전수 수집 + 접근 가능한 논문의 abstract/method 확인 + 핵심 scheduling/feasibility 논문 수동 검토**를 결합해 작성했다.
+
 awesome-fm4co `LLMs for Combinatorial Optimization` 섹션의 전체 157편을 remark 기준으로 세면 다음과 같다.
 
 | Category | Count |
