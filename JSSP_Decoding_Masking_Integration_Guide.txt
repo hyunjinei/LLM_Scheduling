@@ -1,0 +1,241 @@
+
+JSSP DECODING-TIME MASKING INTEGRATION GUIDE (NO CODE)
+
+Audience
+--------
+This document is written for a model/code assistant (e.g., Codex) that you will ask to modify your repository. It explains *exactly* what to change and what to add—at the level of file names, function names, parameters, and algorithmic steps—without showing literal code. The goal is to enforce strict, decoding-time constraints so that the LLM produces JSSP schedules in the form:
+
+    Job J Operation O, M<Machine>
+
+with *no duplication*, *no omission*, *correct ranges*, *correct precedence*, and *no early 'Makespan:'* line.
+
+
+What You Will Implement
+-----------------------
+Two complementary guards during generation (decoding):
+
+1) Whitelist gating (prefix_allowed_tokens_fn):
+   • At every decoding step, allow only the tokens that are *valid for the current position* (the “slot”) in the output: the job index, the operation index, or the machine index.
+   • This turns impossible outputs (e.g., out-of-range indices, wrong machine, duplicate or wrong-order operations) into structurally impossible events.
+
+2) -Inf masking (LogitsProcessor):
+   • Until all (Job, Operation) pairs have been emitted, make the “Makespan” starter token(s) impossible (set scores to -∞).
+   • Eliminates premature termination (“Makespan:” printed before all operations are listed).
+
+You will add a small, self-contained module that builds both guards and connect it to the existing generation entrypoints.
+
+
+Where to Integrate (Files & Functions)
+--------------------------------------
+Keep training and preprocessing unchanged. You will only modify inference/generation:
+
+1) solution_generation_english.py
+   • Entry points to generation, including:
+     - gen(...): line-level text generation wrapper over model.generate(...).
+     - generate_multiple_solutions(...): top-level per-problem generation + validation flow.
+   • You will add two *optional* parameters to gen(...), and wire them through to model.generate(...). You will also instantiate the constraint hooks inside generate_multiple_solutions(...), then pass them into gen(...).
+
+2) inference_jssp_fssp_원본.py
+   • CLI runner that calls generate_multiple_solutions(...).
+   • You will add a CLI boolean switch to disable masking at run-time (optional but recommended).
+   • You will pass that switch through to generate_multiple_solutions(...).
+
+Files for reference in your repo:
+• solution_generation_english.py — hosts gen(...) and generate_multiple_solutions(...).
+• inference_jssp_fssp_원본.py — wraps evaluation over a dataset and calls generate_multiple_solutions(...).
+• data_preprocessing_english.py — leave as-is; it builds prompts for training/inference.
+• unified_trainer.py — training script; not touched by decoding constraints.
+• helping_functions_korea.py — result export helpers; not touched by decoding constraints.
+
+
+New Module to Add
+-----------------
+Add a new file (module) named: jssp_masking_hooks.py
+
+This module will expose two *builders* and a small stateful FSM class:
+
+A) build_prefix_allowed_tokens_fn_from_instance(tokenizer, inst_for_ortools) -> JSSPInstanceFSM
+   • Returns a *callable* object suitable for Hugging Face’s generate(..., prefix_allowed_tokens_fn=...).
+   • It is stateful across the decoding of exactly one solution. Internally it keeps track of which (Job, Operation) pairs were already emitted and, given the *current output tail*, returns the set of token IDs that are valid *for the next token only*.
+
+B) build_logits_processors(tokenizer, fsm) -> LogitsProcessorList
+   • Returns a list including a single LogitsProcessor that forbids the start of “Makespan” until the FSM reports that all (J,O) pairs are emitted.
+
+C) Class: JSSPInstanceFSM
+   • Constructor arguments:
+     - tokenizer: the generation tokenizer.
+     - inst_for_ortools: a nested list shaped as [job][operation] = [machine, duration], already present in your pipeline.
+       › num_jobs := len(inst_for_ortools)
+       › num_machines := len(inst_for_ortools[0])  (assuming the same number of operations per job)
+     - Internal mapping: machine_of[(j,o)] := inst_for_ortools[j][o][0].
+   • Public callable signature: fsm(batch_id, input_ids) -> List[int]
+     - Decodes the current input_ids to text (skip special tokens) and analyzes the tail of the text to determine which “slot” we are in (job index / operation index / machine index / other).
+     - Returns the list of token IDs that are allowed *for the next token only*. All others will be treated internally as -∞ by the generation API.
+   • Additional method used by the LogitsProcessor: fsm._all_done() -> bool to indicate when all (j,o) pairs have been emitted.
+
+IMPORTANT: You will not reference the raw “[problem]” text inside this module. You will rely on inst_for_ortools (already provided by the caller) as the single source of truth for ranges and machine assignments.
+
+
+Constraints to Enforce (During Decoding)
+----------------------------------------
+Let J = number of jobs = len(inst_for_ortools), and K = number of operations per job = len(inst_for_ortools[0]).
+
+1) Output format per line:
+   • Literal pattern: “Job J Operation O, M<M>” (English capitalization; commas and spaces as currently used in your outputs).
+   • The module *does not* force punctuation; the model already learned the format. The module only enforces the numeric parts and overall completion.
+
+2) Range and eligibility per “slot”:
+   • Job slot (“Job <...>”):
+     - Allowed values: the set of jobs that still have at least one operation remaining *and* satisfy precedence (the next admissible op exists for that job).
+   • Operation slot (“Job J Operation <...>”):
+     - Allowed value: exactly one number — the *next admissible operation index* for that job (0..K-1, but only the minimal not-yet-scheduled index with all predecessors done).
+   • Machine slot (“Job J Operation O, M<...>”):
+     - Allowed value: exactly one number — the required machine id from inst_for_ortools[J][O][0].
+
+3) No duplicates:
+   • Once (J,O) is emitted (i.e., a full line “Job J Operation O, M<M>” has appeared), it must be considered *scheduled* and cannot be emitted again.
+
+4) Precedence:
+   • Operation O>0 for job J is admissible only if all operations 0..O-1 for J have already been scheduled (globally in the output stream, not just within a job block).
+
+5) Completeness & termination gating:
+   • Total required operations: J * K. Until that many distinct (J,O) pairs are emitted, the “Makespan” line must not be allowed to start.
+
+6) Multi-digit job indices (e.g., up to 500 jobs):
+   • Apply “digit-wise prefix gating”: when the user has typed a partial numeric prefix, allow only those next digits that lead to a *valid* job index (0..J-1) that still remains eligible.
+   • Similar digit-wise gating applies to operation and machine digits, although those are single-digit in many of your problems.
+   • Account for tokenizers that have both “0” and “ 0” (leading-space version) as single tokens. Your gating must accept either form to make typing numbers smooth.
+
+
+How the FSM Decides the Current Slot (No Code, Only Logic)
+----------------------------------------------------------
+1) Maintain an internal “scheduled” set of (J,O) pairs by scanning the *already generated* text for occurrences of the canonical line pattern “Job <j> Operation <o>, M<m>”.
+2) Inspect the *current tail* of the decoded text to detect one of these states:
+   • “job” slot: the tail matches “… Job ” (with or without whitespace). You are about to type a job index.
+   • “op” slot: the tail matches “… Job <j> Operation ”. You are about to type an operation index for job <j>.
+   • “mach” slot: the tail matches “… Job <j> Operation <o>, M”. You are about to type the machine id.
+   • “other”: anything else — do not restrict (return full vocabulary) unless you choose to harden more places later.
+3) For “job” slot:
+   • Compute the set of jobs that still have a next admissible operation (respect precedence & duplicates). Use digit-wise prefix gating to return only those next-digit tokens that can lead to one of the still-valid job numbers.
+4) For “op” slot (given j):
+   • Find next admissible operation index k for job j (smallest not-yet-scheduled index such that all predecessors are in “scheduled”). Permit only digit(s) that lead to k.
+5) For “mach” slot (given j,o):
+   • Verify that o equals the next admissible operation for j at this exact time. If not, block everything (return nothing) to avoid drift.
+   • Permit only digit(s) that lead to m_required := inst_for_ortools[j][o][0].
+6) After every call, if the FSM detects that the total number of scheduled operations equals J*K, consider the schedule complete; at that point you no longer need to restrict tokens (the LogitsProcessor will separately allow “Makespan” to start).
+
+
+LogitsProcessor: the -Inf Guard for “Makespan”
+----------------------------------------------
+1) Build a small LogitsProcessor that holds a reference to the FSM.
+2) In its __call__, decode the input ids to text and synchronize the FSM’s “scheduled” set.
+3) If FSM reports *not complete*, then for any token that constitutes the *start* of the word “Makespan” (both with and without a leading space; also optionally “Make” if your tokenizer splits it), set the corresponding score to -∞. This blocks the model from starting “Makespan:” too early.
+4) Once FSM reports complete, do not block anything — the model can then print “Makespan: …”.
+
+
+Wiring Changes (Step-by-Step, No Code)
+--------------------------------------
+(1) In solution_generation_english.py — function gen(...):
+    • Add two new optional parameters at the end of the signature:
+      - prefix_allowed_tokens_fn (default: None)
+      - logits_processor (default: None)
+    • When calling model.generate(...), forward these two options:
+      - generate(..., prefix_allowed_tokens_fn=prefix_allowed_tokens_fn, logits_processor=logits_processor, ...)
+
+(2) In solution_generation_english.py — function generate_multiple_solutions(...):
+    • Import the builders from the new module:
+      - build_prefix_allowed_tokens_fn_from_instance
+      - build_logits_processors
+    • Just after you prepare the “prompt” for the current problem, construct the constraint hooks *once per problem*:
+      - fsm := build_prefix_allowed_tokens_fn_from_instance(tokenizer, inst_for_ortools)
+      - logits_procs := build_logits_processors(tokenizer, fsm)
+    • When calling gen(...), pass:
+      - prefix_allowed_tokens_fn=fsm
+      - logits_processor=logits_procs
+    • Everything else in generate_multiple_solutions (parsing, schedule recomputation, validation, saving) remains unchanged. You already have parse_solution_order, calculate_schedule, validate_schedule, and format_solution; keep using them for post-checking.
+
+(3) In inference_jssp_fssp_원본.py — CLI glue (optional but recommended):
+    • Add a boolean CLI flag, e.g., --disable_masking (default False).
+    • Pass use_masking = not args.disable_masking down into generate_multiple_solutions(...). If you add use_masking as a new parameter with default True, you can easily toggle masking off for ablation tests without touching code again.
+
+(4) No training/preprocessing changes:
+    • data_preprocessing_english.py: unchanged.
+    • unified_trainer.py: unchanged.
+    • helping_functions_korea.py and result saving: unchanged.
+
+
+Handling 50-Job Training vs 500-Job Inference
+---------------------------------------------
+Training on smaller instances does not prevent inference on larger instances once decoding-time constraints are in place. The whitelist gate provides the *numerical scaffolding* that guides the model to construct multi-digit job ids (e.g., 3-digit indices for 500 jobs) correctly via digit-wise prefix gating, while precedence and machine constraints keep the structure sound.
+
+
+Operational Tips
+----------------
+• Decoding temperature: If you must guarantee zero mistakes, run greedy decoding (no sampling). If you sample, the sample will still be drawn *only among allowed* tokens, so structural mistakes remain impossible, but the schedule order can vary.
+• Start of constraints: The FSM can start restricting as soon as it sees the output progress reach “Solution:” or the first occurrence of “Job ”. If your model sometimes omits “Solution:”, fall back to triggering on the first “Job ” token.
+• Very long outputs (e.g., J=500, K=2 → 1,000 lines): This approach scales well. The FSM works on the tiny alphabet of digits and maintains only a small “scheduled” set. Use your existing post-validators to ensure correctness.
+• Makespan value: It is safest to *compute* the makespan with your own calculate_schedule(...) and print that value, treating any LLM-reported makespan as non-authoritative.
+
+
+Testing Plan (No Code)
+----------------------
+1) Unit sanity on small instance (J=5, K=2):
+   • Confirm: total number of “Job J Operation O, M<M>” lines equals J*K.
+   • Confirm: every job appears with exactly K operations, in order O=0..K-1.
+   • Confirm: machine id always matches inst_for_ortools[J][O][0].
+   • Confirm: “Makespan:” only appears after all lines.
+2) Medium instance (J=20, K=2) and Large instance (J=500, K=2):
+   • Same checks as above.
+   • Additionally verify no job index outside [0..J-1] is ever printed; for J=500, ensure first digit is always 0..4.
+3) Failure injection:
+   • Temporarily disable the whitelist and verify that problems (duplicates/omissions/out-of-range/misassigned machines) reappear, then re-enable to confirm elimination.
+4) Performance:
+   • Measure end-to-end generation time with and without constraints. There will be a small, acceptable overhead from decoding/regex at each step.
+
+
+Troubleshooting & Edge Cases
+----------------------------
+• Tokenization quirks:
+  - Many tokenizers have both “0” and “ 0” as single tokens. Your FSM should accept either as the “next digit” when building multi-digit numbers.
+  - If the model sometimes lowercases “job”/“operation”: pattern-matching should be case-insensitive to remain robust.
+• Unexpected punctuation/formatting:
+  - The FSM only controls numeric positions. If you need to be even stricter, you can also gate commas, spaces, and brackets, but it is usually unnecessary since your model already learned the textual format.
+• Alternative servers (vLLM/TGI):
+  - If you serve via engines that don’t expose prefix_allowed_tokens_fn, use a library that supports constrained decoding (e.g., JSON/regex grammars) or replicate the whitelist logic via their plugin system. In your current pipeline, you are calling HF generate(...) directly (Unsloth wraps it), so you can use both guards as described.
+
+
+Deliverables Checklist (for Codex)
+----------------------------------
+1) Create a new module file: jssp_masking_hooks.py
+   • Expose:
+     - build_prefix_allowed_tokens_fn_from_instance(tokenizer, inst_for_ortools) -> JSSPInstanceFSM
+     - build_logits_processors(tokenizer, fsm) -> LogitsProcessorList
+   • Implement the stateful class JSSPInstanceFSM with:
+     - scheduled: Set[(job, op)]
+     - machine_of[(j,o)]
+     - callable(...) returning the allowed token IDs for the *next* token based on the current slot
+     - internal logic for digit-wise prefix gating and slot detection
+     - method _all_done() -> bool
+
+2) Modify solution_generation_english.py
+   • gen(...): add two optional parameters (prefix_allowed_tokens_fn, logits_processor) and forward them into model.generate(...).
+   • generate_multiple_solutions(...): import builders from jssp_masking_hooks.py, instantiate fsm/logits_procs per problem using inst_for_ortools, pass them into gen(...).
+   • (Optionally) add a boolean parameter use_masking=True and wire a simple if to construct hooks only when True.
+
+3) Modify inference_jssp_fssp_원본.py (optional but recommended)
+   • Add a CLI flag --disable_masking. Compute use_masking = not args.disable_masking and pass it into generate_multiple_solutions(...).
+
+4) Do NOT change training or preprocessing:
+   • data_preprocessing_english.py: unchanged.
+   • unified_trainer.py: unchanged.
+   • Results saving utilities: unchanged.
+
+5) Test on 5×2, 20×2, and 500×2 problems. Confirm zero duplicates/omissions, correct precedence, correct machine assignment, and “Makespan:” appears only at the end.
+
+
+Rationale Recap
+---------------
+• Whitelist gating and -Inf masking are both “decoding-time only” and keep your LoRA/Unsloth training intact.
+• Whitelist gating is the core that guarantees correctness: out-of-range indices, wrong machine ids, and precedence mistakes become *unrepresentable* token sequences.
+• -Inf masking adds a simple safety valve to block premature “Makespan:”.
+• This architecture scales to hundreds of jobs and is robust to tokenization quirks via digit-wise gating.

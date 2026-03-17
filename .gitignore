@@ -1,0 +1,41 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local secrets and env
+.env
+.env.*
+secrets.local.py
+*.local
+
+# Generated datasets and preprocessing outputs
+train_data/
+validation_data/
+preprocessed_jssp_data/
+llm_jssp/train.json
+
+# Training / inference artifacts
+outputs/
+val_results/
+checkpoint-*/
+**/checkpoint-*/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Generated analysis artifacts
+demo_*.csv
+eval_*.csv
+evaluate_*.csv
+output_*.csv
+*.log
+
+# Misc local files
+.DS_Store
+Thumbs.db
