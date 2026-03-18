@@ -31,6 +31,18 @@ from PyPDF2 import PdfReader
 AWESOME_FM4CO_RAW = "https://raw.githubusercontent.com/ai4co/awesome-fm4co/main/README.md"
 OUT_DIR = Path("literature_review")
 USER_AGENT = {"User-Agent": "Mozilla/5.0"}
+SOURCE_OVERRIDES = {
+    "STARJOB: Dataset for LLM-Driven Job Shop Scheduling": {
+        "abstract_url": "https://arxiv.org/abs/2503.01877",
+        "method_pdf_url": "https://arxiv.org/pdf/2503.01877",
+        "note": "used arXiv mirror instead of OpenReview",
+    },
+    "ACCORD: Autoregressive Constraint-satisfying Generation for COmbinatorial Optimization with Routing and Dynamic attention": {
+        "abstract_url": "https://arxiv.org/abs/2506.11052",
+        "method_pdf_url": "https://arxiv.org/pdf/2506.11052",
+        "note": "used arXiv mirror instead of OpenReview",
+    },
+}
 
 
 @dataclass
@@ -129,8 +141,26 @@ def fetch_html(url: str) -> str:
     return response.text
 
 
-def fetch_abstract(url: str, source_type: str) -> tuple[str, str, str]:
+def fetch_abstract(
+    url: str,
+    source_type: str,
+    override_abstract_url: Optional[str] = None,
+) -> tuple[str, str, str]:
     try:
+        if override_abstract_url:
+            html = fetch_html(override_abstract_url)
+            abstract = extract_meta(
+                html,
+                [
+                    r'<meta name="citation_abstract" content="([^"]+)"',
+                    r'<meta property="og:description" content="([^"]+)"',
+                    r'<meta name="description" content="([^"]+)"',
+                ],
+            )
+            if not abstract:
+                return "failed", "", f"override abstract URL has no abstract: {override_abstract_url}"
+            return "ok", abstract, ""
+
         if source_type == "arxiv":
             abs_url = arxiv_abs_url(url)
             if not abs_url:
@@ -214,14 +244,18 @@ def find_method_snippet(text: str) -> str:
     return text[:1200].strip()
 
 
-def fetch_method_snippet(url: str, source_type: str) -> tuple[str, str, str]:
-    pdf_url = url
+def fetch_method_snippet(
+    url: str,
+    source_type: str,
+    override_method_pdf_url: Optional[str] = None,
+) -> tuple[str, str, str]:
+    pdf_url = override_method_pdf_url or url
     if source_type == "arxiv":
-        pdf_url = url if "/pdf/" in url else url.replace("/abs/", "/pdf/")
+        pdf_url = override_method_pdf_url or (url if "/pdf/" in url else url.replace("/abs/", "/pdf/"))
     elif source_type == "openreview":
         parsed = urlparse(url)
         paper_id = parse_qs(parsed.query).get("id", [None])[0]
-        if paper_id:
+        if paper_id and not override_method_pdf_url:
             pdf_url = f"https://openreview.net/pdf?id={paper_id}"
     elif source_type not in {"doi_or_publisher", "web"} and not url.lower().endswith(".pdf"):
         return "failed", "", "unsupported source type for method extraction"
@@ -237,9 +271,18 @@ def fetch_method_snippet(url: str, source_type: str) -> tuple[str, str, str]:
 
 def collect_one(row: dict[str, str]) -> PaperRecord:
     source_type = detect_source_type(row["paper_url"])
-    abstract_status, abstract, abstract_note = fetch_abstract(row["paper_url"], source_type)
-    method_status, method_snippet, method_note = fetch_method_snippet(row["paper_url"], source_type)
-    notes = "; ".join(note for note in [abstract_note, method_note] if note)
+    override = SOURCE_OVERRIDES.get(row["title"], {})
+    abstract_status, abstract, abstract_note = fetch_abstract(
+        row["paper_url"],
+        source_type,
+        override_abstract_url=override.get("abstract_url"),
+    )
+    method_status, method_snippet, method_note = fetch_method_snippet(
+        row["paper_url"],
+        source_type,
+        override_method_pdf_url=override.get("method_pdf_url"),
+    )
+    notes = "; ".join(note for note in [override.get("note", ""), abstract_note, method_note] if note)
     return PaperRecord(
         date=row["date"],
         title=row["title"],

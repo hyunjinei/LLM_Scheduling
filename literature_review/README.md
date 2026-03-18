@@ -19,9 +19,9 @@
 - total papers: **157**
 
 자동 수집 커버리지:
-- abstract 수집 성공: **131 / 157**
-- method snippet 수집 성공: **129 / 157**
-- 둘 다 성공: **128 / 157**
+- abstract 수집 성공: **133 / 157**
+- method snippet 수집 성공: **131 / 157**
+- 둘 다 성공: **130 / 157**
 
 ## 실패 원인
 
@@ -29,6 +29,10 @@
 - `openreview.net` 접근 제한 (`403 Forbidden`)
 - 일부 publisher page의 PDF 미제공
 - 일부 PDF 텍스트 추출 실패
+
+현재 수집 스크립트는 핵심 scheduling 논문 중 아래 2편에 대해서는 arXiv 미러를 사용한다.
+- `STARJOB: Dataset for LLM-Driven Job Shop Scheduling`
+- `ACCORD: Autoregressive Constraint-satisfying Generation for COmbinatorial Optimization with Routing and Dynamic attention`
 
 즉 이 카탈로그는 “전부 읽었다”를 주장하기 위한 파일이 아니라, **전수 점검을 재현 가능하게 만드는 근거 파일**이다.
 

@@ -77,11 +77,20 @@
 - `literature_review/llm_for_co_catalog.csv`
 
 현재 자동 수집 기준 커버리지는 다음과 같다.
-- abstract 수집 성공: **131 / 157**
-- method snippet 수집 성공: **129 / 157**
-- 둘 다 수집 성공: **128 / 157**
+- abstract 수집 성공: **133 / 157**
+- method snippet 수집 성공: **131 / 157**
+- 둘 다 수집 성공: **130 / 157**
 
-실패의 대부분은 OpenReview 원문 접근 제한(`403 Forbidden`) 때문이다. 따라서 아래 비교표는 **전체 목록 전수 수집 + 접근 가능한 논문의 abstract/method 확인 + 핵심 scheduling/feasibility 논문 수동 검토**를 결합해 작성했다.
+실패의 대부분은 OpenReview 원문 접근 제한(`403 Forbidden`) 때문이다. 다만 핵심 scheduling 논문 중 `STARJOB`, `ACCORD`는 arXiv 미러를 사용해 보강했다. 따라서 아래 비교표는 **전체 목록 전수 수집 + 접근 가능한 논문의 abstract/method 확인 + 핵심 scheduling/feasibility 논문 수동 검토**를 결합해 작성했다.
+
+현재 시점에서 method 본문까지 우선 검토한 핵심 논문은 다음 7편이다.
+- `LLMs can Schedule`
+- `STARJOB`
+- `Self-Guiding Exploration`
+- `ReflecSched`
+- `Large Language Models as End-to-end Combinatorial Optimization Solvers`
+- `ACCORD`
+- `Hard Constraints Meet Soft Generation`
 
 awesome-fm4co `LLMs for Combinatorial Optimization` 섹션의 전체 157편을 remark 기준으로 세면 다음과 같다.
 
@@ -102,10 +111,10 @@ awesome-fm4co `LLMs for Combinatorial Optimization` 섹션의 전체 157편을 r
 | Author (Year) | Problem | Approach | Objective | Feasibility / Constraint handling | End-to-end direct solving | Inference-time hard guarantee | 본 연구와의 차이 |
 |---|---|---|---|---|---:|---:|---|
 | [Self-Guiding Exploration for Combinatorial Problems (2024)](https://arxiv.org/abs/2405.17950) | TSP, VRP, BPP, AP, KP, JSSP | multi-trajectory prompting + decomposition + refinement | solution quality improvement across CPs | reasoning/refinement로 품질과 validity 개선 | O | X | broad CP prompting 연구이며, explicit feasible-action mask는 없음 |
-| [LLMs can Schedule (2024)](https://arxiv.org/abs/2408.06993) | JSSP | JSSP 전용 dataset 기반 supervised LLM scheduling + sampling | min makespan | 데이터와 sampling으로 feasibility/quality 개선 | O | X | JSSP direct solving이지만 decode-time hard masking은 아님 |
-| [STARJOB: Dataset for LLM-Driven Job Shop Scheduling (2024)](https://openreview.net/forum?id=t0fU6t3Skw) | JSSP | JSSP dataset + fine-tuned LLM scheduler | min makespan | domain data로 scheduling validity 향상 | O | X | JSSP 특화 데이터셋 연구이나 hard feasible decoder는 아님 |
-| [Large Language Models as End-to-end Combinatorial Optimization Solvers (2025)](https://arxiv.org/abs/2509.16865) | TSP, OP, CVRP, MIS, MVC, PFSP, JSSP | SFT → FOARL → Best-of-N | feasibility + optimality gap reduction | RL에서 feasibility/optimality-aware reward 사용 | O | X | feasibility를 높이지만 BoN/sampling 의존이 남음 |
-| [ACCORD (2025)](https://openreview.net/pdf?id=f0TBAdcJ8m) | FSSP, JSSP, BPP, KP, TSP, VRP | autoregressive constraint-satisfying generation | feasibility + quality | constraint-aware autoregressive generation | O | X | 가장 가까운 prior 중 하나지만, env-grounded hard action masking과는 다름 |
+| [LLMs can Schedule (2024)](https://arxiv.org/abs/2408.06993) | JSSP | 120k supervised JSSP dataset + direct LLM scheduling + sampling | min makespan | 데이터와 sampling으로 feasibility/quality 개선 | O | X | JSSP direct solving이지만 decode-time hard masking은 아님 |
+| [STARJOB: Dataset for LLM-Driven Job Shop Scheduling (2024)](https://openreview.net/forum?id=t0fU6t3Skw) | JSSP | 130k supervised JSSP dataset + LLaMA-8B LoRA fine-tuning | min makespan | dataset-driven feasibility/quality improvement | O | X | JSSP 특화 direct scheduler이지만 inference-time hard feasible decoder는 아님 |
+| [Large Language Models as End-to-end Combinatorial Optimization Solvers (2025)](https://arxiv.org/abs/2509.16865) | TSP, OP, CVRP, MIS, MVC, PFSP, JSSP | solver-generated data → SFT → FOARL → Best-of-N | feasibility + optimality gap reduction | RL에서 feasibility/optimality-aware reward 사용 | O | X | feasibility를 높이지만 BoN/sampling 의존이 남음 |
+| [ACCORD (2025)](https://openreview.net/pdf?id=f0TBAdcJ8m) | FSSP, JSSP, BPP, KP, TSP, VRP | constraint-encoding dataset representation + dynamic routing attention + task-specific LoRA | feasibility + quality | autoregressive constraint-satisfying generation | O | X | 가장 가까운 prior 중 하나지만, explicit env-grounded hard action masking과는 다름 |
 | [Hard Constraints Meet Soft Generation (2026)](https://arxiv.org/abs/2602.01090) | TSP, OP, CVRP, MIS, MVC, PFSP, JSSP | FALCON: grammar-constrained decoding + feasibility repair + adaptive BoN + BOPO | 100% feasibility + quality | grammar + repair + adaptive sampling | O | O | 100% feasibility를 달성하지만 repair/adaptive BoN에 의존 |
 | **This Research** | **JSSP** | **step-level policy + decode-time feasible-action masking + environment validation** | **min makespan** | **invalid action 제거 후 decode, step transition 즉시 검증** | **O** | **O*** | **repair/BoN 없이 action-level feasibility를 직접 강제** |
 
@@ -119,11 +128,11 @@ awesome-fm4co `LLMs for Combinatorial Optimization` 섹션의 전체 157편을 r
 |---|---|---|---|---|---|
 | [Can Language Models Solve Graph Problems in Natural Language? (2023)](https://arxiv.org/abs/2305.10037) | graph problems | natural-language answer generation | task correctness | explicit hard feasibility control 없음 | 초기 direct-solver 계열이지만 scheduling과는 거리 있음 |
 | [Self-Guiding Exploration for Combinatorial Problems (2024)](https://arxiv.org/abs/2405.17950) | multi-CP incl. JSSP | multiple thought trajectories + refinement | optimization performance | refinement 중심 | hard action-space control 없음 |
-| [LLMs can Schedule (2024)](https://arxiv.org/abs/2408.06993) | JSSP | direct schedule generation from prompt | min makespan | training + sampling | step-level feasibility mask 부재 |
-| [STARJOB (2024)](https://openreview.net/forum?id=t0fU6t3Skw) | JSSP | dataset-driven direct scheduler | min makespan | data-driven validity improvement | inference-time hard guarantee 부재 |
-| [ReflecSched (2025)](https://arxiv.org/abs/2508.01724) | DFJSP | LLM-powered hierarchical reflection | dynamic scheduling quality | heuristic simulation summaries 사용 | reflection 기반이며 hard action masking과는 다름 |
+| [LLMs can Schedule (2024)](https://arxiv.org/abs/2408.06993) | JSSP | 120k dataset 기반 direct schedule generation + sampling | min makespan | training + sampling | step-level feasibility mask 부재 |
+| [STARJOB (2024)](https://openreview.net/forum?id=t0fU6t3Skw) | JSSP | 130k dataset + LLaMA-8B LoRA direct scheduler | min makespan | data-driven validity improvement | inference-time hard guarantee 부재 |
+| [ReflecSched (2025)](https://arxiv.org/abs/2508.01724) | DFJSP | heuristic simulations → strategic experience summary → final LLM decision | dynamic scheduling quality | heuristic simulation summaries 사용 | reflection 기반이며 hard action masking과는 다름 |
 | [Large Language Models as End-to-end Combinatorial Optimization Solvers (2025)](https://arxiv.org/abs/2509.16865) | 7 CO tasks incl. PFSP/JSSP | direct solution generation + SFT/RL/BoN | feasibility + objective gap | FOARL + BoN | high feasibility but not pure mask-based guarantee |
-| [ACCORD (2025)](https://openreview.net/pdf?id=f0TBAdcJ8m) | TSP, VRP, KP, BPP, FSSP, JSSP | autoregressive direct generation | feasibility + quality | constraint-satisfying generation | still not explicit env-feasible action interface |
+| [ACCORD (2025)](https://openreview.net/pdf?id=f0TBAdcJ8m) | TSP, VRP, KP, BPP, FSSP, JSSP | autoregressive direct generation with dynamic routing attention | feasibility + quality | constraint-satisfying generation | still not explicit env-feasible action interface |
 | [Hard Constraints Meet Soft Generation (2026)](https://arxiv.org/abs/2602.01090) | 7 CO tasks incl. PFSP/JSSP | direct generation + grammar/repair/adaptive BoN | perfect feasibility + quality | grammar + repair | guarantee는 있으나 repair가 핵심 구성요소 |
 | **This Research** | **JSSP** | **text-state → next action direct generation** | **min makespan** | **decode-time feasible-action mask + env validation** | **whole-solution free-form이 아니라 step-policy라는 점이 차별점** |
 
@@ -135,14 +144,14 @@ awesome-fm4co `LLMs for Combinatorial Optimization` 섹션의 전체 157편을 r
 |---|---|---|---|---|---|---|
 | [AI-Copilot for Business Optimisation (2023)](https://arxiv.org/pdf/2309.13218) | JSSP | optimization copilot / formulation | scheduling formulation | Formulation | X | direct scheduler가 아니라 modeling 지원 |
 | [Self-Guiding Exploration for Combinatorial Problems (2024)](https://arxiv.org/abs/2405.17950) | JSSP 포함 | multi-trajectory prompting | solution quality | Solution | 제한적 | broad CP direct solving prior |
-| [LLMs can Schedule (2024)](https://arxiv.org/abs/2408.06993) | JSSP | dataset-based LLM scheduling | makespan | Solution | X | 가장 직접적인 JSSP prior 중 하나 |
-| [STARJOB (2024)](https://openreview.net/forum?id=t0fU6t3Skw) | JSSP | dataset + LLM-driven scheduling | makespan | Solution | X | JSSP dataset/fine-tuning prior |
+| [LLMs can Schedule (2024)](https://arxiv.org/abs/2408.06993) | JSSP | 120k supervised dataset + sampling-enhanced direct scheduling | makespan | Solution | X | 가장 직접적인 JSSP prior 중 하나 |
+| [STARJOB (2024)](https://openreview.net/forum?id=t0fU6t3Skw) | JSSP | 130k dataset + LoRA-finetuned LLaMA-8B scheduler | makespan | Solution | X | JSSP dataset/fine-tuning prior |
 | [Automatic programming via LLMs ... (2024)](https://arxiv.org/pdf/2410.22657) | DyJSSP | automatic rule/program generation | dynamic scheduling | Algorithm | X | direct policy가 아니라 heuristic design |
 | [REMoH (2025)](https://arxiv.org/pdf/2506.07759) | FJSSP | reflective heuristic evolution | multi-objective heuristic quality | Algorithm | X | heuristic evolution 계열 |
-| [ReflecSched (2025)](https://arxiv.org/abs/2508.01724) | DFJSP | hierarchical reflection | dynamic scheduling quality | Solution | 부분적 | reflection-based dynamic scheduling prior |
-| [LLM as End-to-end CO Solvers (2025)](https://arxiv.org/abs/2509.16865) | PFSP, JSSP | direct solver + FOARL + BoN | feasibility + objective gap | Solution | 부분적 | strong end-to-end baseline |
+| [ReflecSched (2025)](https://arxiv.org/abs/2508.01724) | DFJSP | heuristic simulation analysis + strategic experience + final LLM decision | dynamic scheduling quality | Solution | 부분적 | reflection-based dynamic scheduling prior |
+| [LLM as End-to-end CO Solvers (2025)](https://arxiv.org/abs/2509.16865) | PFSP, JSSP | solver-distilled direct solver + FOARL + BoN | feasibility + objective gap | Solution | 부분적 | strong end-to-end baseline |
 | [LLM4EO (2025)](https://arxiv.org/pdf/2511.16485) | FJSP | evolutionary optimization with LLM | scheduling quality | Algorithm | X | heuristic/evolutionary optimization |
-| [ACCORD (2025)](https://openreview.net/pdf?id=f0TBAdcJ8m) | FSSP, JSSP | autoregressive constraint-satisfying generation | feasibility + quality | Solution & Benchmark | O (improved) | 가장 가까운 autoregressive scheduling prior 중 하나 |
+| [ACCORD (2025)](https://openreview.net/pdf?id=f0TBAdcJ8m) | FSSP, JSSP | constraint-aware autoregressive generation + dynamic routing attention | feasibility + quality | Solution & Benchmark | O (improved) | 가장 가까운 autoregressive scheduling prior 중 하나 |
 | [Leveraging LLMs for efficient scheduling ... (2025)](https://doi.org/10.1038/s44334-025-00061-w) | DFJSP | LLM-assisted scheduling in HRC-FMS | schedule efficiency | Algorithm | X | industrial scheduling relevance 큼 |
 | [LLM-Assisted Automatic Dispatching Rule Design ... (2026)](https://arxiv.org/pdf/2601.15738) | Dynamic FAFSP | dispatching rule design | flow-shop scheduling quality | Algorithm | X | dispatch relevance는 높지만 direct masked policy는 아님 |
 | [Hard Constraints Meet Soft Generation (2026)](https://arxiv.org/abs/2602.01090) | PFSP, JSSP | grammar + repair + adaptive BoN | perfect feasibility + quality | Solution | O | feasibility guarantee를 정면으로 다룬 강력한 baseline |
