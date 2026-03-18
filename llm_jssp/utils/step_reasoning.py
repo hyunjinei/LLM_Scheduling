@@ -40,18 +40,31 @@ def _machine_label(machine_id: object) -> str:
     return f"M{machine_int}" if machine_int >= 0 else "M-"
 
 
+def _format_route_tokens(route_tokens: Sequence[object]) -> str:
+    if not route_tokens:
+        return "[]"
+    return "[" + ", ".join(str(token) for token in route_tokens) + "]"
+
+
+def _route_contains_machine(route_tokens: Sequence[object], machine_id: int) -> bool:
+    if machine_id < 0:
+        return False
+    prefix = f"M{machine_id}:"
+    return any(str(token).startswith(prefix) for token in route_tokens)
+
+
 def _effect_bottleneck_relation(
     effect: Dict[str, object],
     bottleneck_machine_id: int,
 ) -> str:
     machine_id = int(effect.get("machine_id", -1))
-    next2_machine = int(effect.get("next2_machine", -1))
     remaining_ops_after = int(effect.get("remaining_ops_after", 0))
+    post_route_tokens = effect.get("post_route_tokens", [])
     if bottleneck_machine_id < 0:
         return "unknown"
     if machine_id == bottleneck_machine_id:
         return "direct"
-    if remaining_ops_after > 0 and next2_machine == bottleneck_machine_id:
+    if remaining_ops_after > 0 and _route_contains_machine(post_route_tokens, bottleneck_machine_id):
         return "releases_future_bottleneck"
     return "indirect"
 
@@ -66,8 +79,7 @@ def _effect_summary_lines(
         else -1
     )
     return [
-        f"- next_machine: {_machine_label(effect['machine_id'])}",
-        f"- next2_machine: {_machine_label(effect.get('next2_machine', -1))}",
+        f"- operation machine: {_machine_label(effect['machine_id'])}",
         f"- bottleneck_relation: {_effect_bottleneck_relation(effect, bottleneck_machine_id)}",
         f"- cmax: {int(effect['current_cmax_before'])}->{int(effect['current_cmax_after'])}",
         f"- delta_cmax: {int(effect['delta_cmax'])}",
@@ -78,7 +90,7 @@ def _effect_summary_lines(
         f"- remaining_ops_after: {int(effect['remaining_ops_after'])}",
         f"- remaining_work_after: {int(effect['remaining_work_after'])}",
         f"- machine_load: {int(effect['affected_machine_load'])}",
-        f"- downstream_route: {_machine_label(effect.get('next2_machine', -1))}, next2_p={int(effect.get('next2_proc_time', 0))}",
+        f"- post_route: {_format_route_tokens(effect.get('post_route_tokens', []))}",
     ]
 
 
@@ -118,7 +130,7 @@ def build_reason_input_text(
         ),
         (
             "Ground the explanation in explicit evidence only: immediate timing/Cmax impact, "
-            "bottleneck-machine use or release, downstream route exposure (next2), "
+            "bottleneck-machine use or release, post-route exposure, "
             "waiting/idle trade-offs, and contrast against top alternatives."
         ),
         "",
@@ -140,8 +152,8 @@ def build_reason_input_text(
             lines.append(
                 (
                     f"- {alt['action_code']}: "
-                    f"machine={_machine_label(alt['machine_id'])}, "
-                    f"next2={_machine_label(alt.get('next2_machine', -1))}, "
+                    f"operation machine={_machine_label(alt['machine_id'])}, "
+                    f"post_route={_format_route_tokens(alt.get('post_route_tokens', []))}, "
                     f"cmax {int(alt['current_cmax_before'])}->{int(alt['current_cmax_after'])}, "
                     f"delta_cmax={int(alt['delta_cmax'])}, "
                     f"est_start={int(alt['estimated_start'])}, "
@@ -175,19 +187,18 @@ def _chosen_bottleneck_clause(
     bottleneck_ops_left: int,
 ) -> str:
     machine_id = int(effect.get("machine_id", -1))
-    next2_machine = int(effect.get("next2_machine", -1))
-    next2_proc_time = int(effect.get("next2_proc_time", 0))
     affected_machine_load = int(effect.get("affected_machine_load", 0))
+    post_route = _format_route_tokens(effect.get("post_route_tokens", []))
     if bottleneck_machine_id >= 0 and machine_id == bottleneck_machine_id:
         return (
             f"It directly activates the current bottleneck machine {_machine_label(machine_id)} "
             f"(remaining_load={bottleneck_load}, ops_left={bottleneck_ops_left}), so delaying this move "
             "would postpone work on the heaviest unresolved machine frontier."
         )
-    if bottleneck_machine_id >= 0 and next2_machine == bottleneck_machine_id:
+    if bottleneck_machine_id >= 0 and _route_contains_machine(effect.get("post_route_tokens", []), bottleneck_machine_id):
         return (
-            f"It also exposes a downstream step on bottleneck {_machine_label(bottleneck_machine_id)} "
-            f"(next2_p={next2_proc_time}), pulling future critical work closer."
+            f"Its post_route keeps future work on bottleneck "
+            f"{_machine_label(bottleneck_machine_id)} visible and ready for earlier activation."
         )
     if bottleneck_machine_id >= 0 and affected_machine_load >= max(1, int(0.75 * bottleneck_load)):
         return (
@@ -205,17 +216,15 @@ def _chosen_progress_clause(effect: Dict[str, object]) -> str:
     rem_ops_after = int(effect.get("remaining_ops_after", 0))
     rem_work_before = int(effect.get("remaining_work_before", 0))
     rem_work_after = int(effect.get("remaining_work_after", 0))
-    next2_machine = int(effect.get("next2_machine", -1))
-    next2_proc_time = int(effect.get("next2_proc_time", 0))
     if rem_ops_after <= 0:
         return (
             f"It completes this job, eliminating the remaining work from {rem_work_before} to 0."
         )
-    if next2_machine >= 0:
+    post_route = _format_route_tokens(effect.get("post_route_tokens", []))
+    if post_route != "[]":
         return (
             f"It reduces this job from remaining_work {rem_work_before}->{rem_work_after} "
-            f"and remaining_ops {rem_ops_before}->{rem_ops_after}, while exposing the next route "
-            f"on {_machine_label(next2_machine)} (t={next2_proc_time})."
+            f"and remaining_ops {rem_ops_before}->{rem_ops_after}, leaving post_route={post_route}."
         )
     return (
         f"It reduces this job from remaining_work {rem_work_before}->{rem_work_after} "
@@ -291,8 +300,8 @@ def _alt_reason_line(
     chosen_after = int(chosen.get("current_cmax_after", chosen.get("estimated_makespan_after", 0)))
     alt_machine = int(alt.get("machine_id", -1))
     chosen_machine = int(chosen.get("machine_id", -1))
-    alt_next2 = int(alt.get("next2_machine", -1))
-    chosen_next2 = int(chosen.get("next2_machine", -1))
+    alt_post_route_tokens = alt.get("post_route_tokens", [])
+    chosen_post_route_tokens = chosen.get("post_route_tokens", [])
 
     clauses: List[str] = []
     if alt_after > chosen_after:
@@ -312,7 +321,11 @@ def _alt_reason_line(
         clauses.append(
             f"does not activate bottleneck {_machine_label(bottleneck_machine_id)}"
         )
-    elif bottleneck_machine_id >= 0 and chosen_next2 == bottleneck_machine_id and alt_next2 != bottleneck_machine_id:
+    elif (
+        bottleneck_machine_id >= 0
+        and _route_contains_machine(chosen_post_route_tokens, bottleneck_machine_id)
+        and not _route_contains_machine(alt_post_route_tokens, bottleneck_machine_id)
+    ):
         clauses.append(
             f"does not pull the future bottleneck step on {_machine_label(bottleneck_machine_id)} forward"
         )
@@ -332,9 +345,10 @@ def _alt_reason_line(
 
     rem_work_after = int(alt.get("remaining_work_after", 0))
     rem_ops_after = int(alt.get("remaining_ops_after", 0))
-    if rem_ops_after > 0 and alt_next2 >= 0:
+    post_route = _format_route_tokens(alt_post_route_tokens)
+    if rem_ops_after > 0 and post_route != "[]":
         clauses.append(
-            f"after this move it still leaves {rem_work_after} work and {rem_ops_after} ops, with next route on {_machine_label(alt_next2)} (t={int(alt.get('next2_proc_time', 0))})"
+            f"after this move it still leaves {rem_work_after} work and {rem_ops_after} ops, with post_route={post_route}"
         )
     else:
         clauses.append(

@@ -19,6 +19,12 @@ def _format_action_codes(action_codes: Sequence[str]) -> str:
     return "[" + ", ".join(str(code) for code in action_codes) + "]"
 
 
+def _format_route_tokens(route_tokens: Sequence[str]) -> str:
+    if not route_tokens:
+        return "[]"
+    return "[" + ", ".join(str(token) for token in route_tokens) + "]"
+
+
 def _format_value(value: object) -> str:
     if isinstance(value, float):
         return f"{value:.4f}".rstrip("0").rstrip(".")
@@ -68,6 +74,7 @@ def compute_action_transition_features(
     job_total_work: List[int] = state_json.get("job_total_work", [1] * len(next_machine))  # type: ignore[assignment]
     machine_remaining_load: List[int] = state_json.get("machine_remaining_load", [0] * len(machine_ready_time))  # type: ignore[assignment]
     machine_remaining_ops: List[int] = state_json.get("machine_remaining_ops", [0] * len(machine_ready_time))  # type: ignore[assignment]
+    post_route_tokens_by_job: List[List[str]] = state_json.get("post_route_tokens", [[] for _ in next_machine])  # type: ignore[assignment]
 
     current_time = int(state_json.get("current_time", 0))
     current_cmax = int(
@@ -146,6 +153,8 @@ def compute_action_transition_features(
                     float(affected_machine_load) / float(max(total_remaining_work, 1))
                 ),
                 "remaining_work_after_ratio": float(rem_work_after) / float(total_work),
+                "post_route_tokens": list(post_route_tokens_by_job[job]),
+                "post_route_len": int(len(post_route_tokens_by_job[job])),
             }
         )
 
@@ -163,10 +172,8 @@ def compute_action_transition_features(
 def render_action_transition_line(effect: Dict[str, object]) -> str:
     return (
         f"{effect['action_code']} | "
-        f"next_m={_machine_token(int(effect['next_machine']))} | "
-        f"p={effect['next_proc_time']} | "
-        f"next2_m={_machine_token(int(effect['next2_machine']))} | "
-        f"next2_p={effect['next2_proc_time']} | "
+        f"operation machine={_machine_token(int(effect['next_machine']))} | "
+        f"processing time={effect['next_proc_time']} | "
         f"decision_t={effect['decision_time']} | "
         f"est_start={effect['estimated_start']} | "
         f"est_end={effect['estimated_end']} | "
@@ -178,7 +185,8 @@ def render_action_transition_line(effect: Dict[str, object]) -> str:
         f"rem_work:{effect['remaining_work_before']}->{effect['remaining_work_after']} | "
         f"machine_load={effect['affected_machine_load']} | "
         f"machine_ops_left={effect['affected_machine_ops_left']} | "
-        f"rem_work_after_ratio={_format_value(effect['remaining_work_after_ratio'])}"
+        f"rem_work_after_ratio={_format_value(effect['remaining_work_after_ratio'])} | "
+        f"post_route={_format_route_tokens(effect.get('post_route_tokens', []))}"
     )
 
 

@@ -24,6 +24,12 @@ def _format_action_codes(action_codes: Sequence[str]) -> str:
     return "[" + ", ".join(str(code) for code in action_codes) + "]"
 
 
+def _format_route_tokens(route_tokens: Sequence[str]) -> str:
+    if not route_tokens:
+        return "[]"
+    return "[" + ", ".join(str(token) for token in route_tokens) + "]"
+
+
 def _safe_ratio(numerator: float, denominator: float) -> float:
     if float(denominator) == 0.0:
         return 0.0
@@ -103,10 +109,7 @@ def invert_action_code_map(action_code_to_job: Dict[str, int]) -> Dict[int, str]
 
 def build_problem_context_text(inst_for_ortools: Sequence[Sequence[Sequence[int]]]) -> str:
     """
-    Build compact static problem context text.
-
-    This is optional but useful when we want each step prompt to include
-    global problem structure, not only dynamic state.
+    Build minimal static problem context text.
     """
     num_jobs = len(inst_for_ortools)
     total_ops = sum(len(job_ops) for job_ops in inst_for_ortools)
@@ -116,17 +119,7 @@ def build_problem_context_text(inst_for_ortools: Sequence[Sequence[Sequence[int]
             max_machine = max(max_machine, int(machine_id))
     num_machines = max_machine + 1 if max_machine >= 0 else 0
 
-    lines = [
-        f"Problem: {num_jobs} jobs x {num_machines} machines (total_ops={total_ops})",
-        "Fixed operation routes:",
-    ]
-    for job_id, job_ops in enumerate(inst_for_ortools):
-        total_work = sum(int(p) for _, p in job_ops)
-        route = " -> ".join(f"(M{int(m)},t{int(p)})" for m, p in job_ops)
-        lines.append(
-            f"Job {job_id}: ops={len(job_ops)}, total_work={total_work}, route={route}"
-        )
-    return "\n".join(lines)
+    return f"Problem: {num_jobs} jobs x {num_machines} machines (total_ops={total_ops})"
 
 
 def summarize_global_dynamic_state(state_json: Dict[str, object]) -> Dict[str, object]:
@@ -172,6 +165,7 @@ def compute_action_transition_features(
     job_total_work: List[int] = state_json.get("job_total_work", [1] * len(next_machine))  # type: ignore[assignment]
     machine_remaining_load: List[int] = state_json.get("machine_remaining_load", [0] * len(machine_ready_time))  # type: ignore[assignment]
     machine_remaining_ops: List[int] = state_json.get("machine_remaining_ops", [0] * len(machine_ready_time))  # type: ignore[assignment]
+    post_route_tokens_by_job: List[List[str]] = state_json.get("post_route_tokens", [[] for _ in next_machine])  # type: ignore[assignment]
 
     current_cmax = int(
         state_json.get("current_cmax", max(machine_ready_time) if machine_ready_time else 0)
@@ -243,6 +237,8 @@ def compute_action_transition_features(
                 _safe_ratio(affected_machine_load, max(total_remaining_work, 1))
             ),
             "remaining_work_after_ratio": float(_safe_ratio(rem_work_after, total_work)),
+            "post_route_tokens": list(post_route_tokens_by_job[job]),
+            "post_route_len": int(len(post_route_tokens_by_job[job])),
         }
         effects.append(effect)
 
@@ -260,10 +256,8 @@ def compute_action_transition_features(
 def render_action_transition_line(effect: Dict[str, object]) -> str:
     return (
         f"{effect['action_code']} | "
-        f"next_m={_machine_token(int(effect['next_machine']))} | "
-        f"p={effect['next_proc_time']} | "
-        f"next2_m={_machine_token(int(effect['next2_machine']))} | "
-        f"next2_p={effect['next2_proc_time']} | "
+        f"operation machine={_machine_token(int(effect['next_machine']))} | "
+        f"processing time={effect['next_proc_time']} | "
         f"rem_ops:{effect['remaining_ops_before']}->{effect['remaining_ops_after']} | "
         f"rem_work:{effect['remaining_work_before']}->{effect['remaining_work_after']} | "
         f"job_prog:{_format_value(effect['job_progress_ratio_before'])}->{_format_value(effect['job_progress_ratio_after'])} | "
@@ -280,7 +274,8 @@ def render_action_transition_line(effect: Dict[str, object]) -> str:
         f"machine_load={effect['affected_machine_load']} | "
         f"machine_ops_left={effect['affected_machine_ops_left']} | "
         f"machine_load_ratio={_format_value(effect['affected_machine_load_ratio'])} | "
-        f"rem_work_after_ratio={_format_value(effect['remaining_work_after_ratio'])}"
+        f"rem_work_after_ratio={_format_value(effect['remaining_work_after_ratio'])} | "
+        f"post_route={_format_route_tokens(effect.get('post_route_tokens', []))}"
     )
 
 

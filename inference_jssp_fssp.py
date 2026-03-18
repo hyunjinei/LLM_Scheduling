@@ -122,6 +122,12 @@ def _resolve_model_path(raw_model_path: str | None) -> str:
     return os.path.expanduser(model_path)
 
 
+def _format_route_tokens(route_tokens) -> str:
+    if not route_tokens:
+        return "[]"
+    return "[" + ", ".join(str(token) for token in route_tokens) + "]"
+
+
 def _load_eval_dataset(run_args):
     if run_args.eval_data_path:
         eval_data_path = os.path.expanduser(run_args.eval_data_path)
@@ -495,17 +501,19 @@ def _build_step_diagnostics(step):
         )
     ]
     if chosen_effect is not None:
+        chosen_post_route = _format_route_tokens(chosen_effect.get("post_route_tokens", []))
         lines.append(
             (
                 "Chosen details: "
                 f"delta_cmax={int(chosen_effect.get('delta_cmax', 0))}, "
                 f"job_wait={int(chosen_effect.get('job_wait', 0))}, "
                 f"machine_idle_gap={int(chosen_effect.get('machine_idle_gap', 0))}, "
-                f"next2=M{int(chosen_effect.get('next2_machine', -1))}/t={int(chosen_effect.get('next2_proc_time', 0))}, "
+                f"post_route={chosen_post_route}, "
                 f"machine_load={int(chosen_effect.get('affected_machine_load', 0))}"
             )
         )
     for rank, opt in enumerate(alternatives[:3], start=1):
+        alt_post_route = _format_route_tokens(opt.get("post_route_tokens", []))
         lines.append(
             (
                 f"Alt{rank}={opt['action_code']}/Job{int(opt['job_id'])}, "
@@ -515,7 +523,7 @@ def _build_step_diagnostics(step):
                 f"delta_cmax={int(opt.get('delta_cmax', 0))}, "
                 f"idle_gap={int(opt.get('machine_idle_gap', 0))}, "
                 f"job_wait={int(opt.get('job_wait', 0))}, "
-                f"next2=M{int(opt.get('next2_machine', -1))}/t={int(opt.get('next2_proc_time', 0))}, "
+                f"post_route={alt_post_route}, "
                 f"machine_load={int(opt.get('affected_machine_load', 0))}"
             )
         )
@@ -549,7 +557,7 @@ def _build_reflection_memory(current_makespan: int, critical_steps):
             (
                 "Episode postmortem: the schedule likely lost quality through one or more of the "
                 "following patterns: delaying bottleneck activation, accepting larger idle/wait gaps "
-                "without structural payoff, or choosing weaker downstream routes when immediate Cmax "
+                "without structural payoff, or choosing weaker post-routes when immediate Cmax "
                 "signals were close."
             ),
             (
@@ -566,7 +574,7 @@ def _build_reflection_memory(current_makespan: int, critical_steps):
         [
             "Reflection rules:",
             "1. Prefer actions that activate or release the bottleneck route earlier.",
-            "2. If immediate projected Cmax is tied or close, prefer lower regret in downstream route progression (next2 machine/time).",
+            "2. If immediate projected Cmax is tied or close, prefer lower regret in post-route progression.",
             "3. Avoid larger machine idle gaps or waits unless they clearly unlock stronger bottleneck progress.",
             "4. Do not repeat previously identified bad choices when a strong feasible alternative exists.",
         ]
@@ -586,8 +594,7 @@ def _build_reflection_memory(current_makespan: int, critical_steps):
         alt_delta = int(best_alt.get("delta_cmax", 0))
         alt_idle_gap = int(best_alt.get("machine_idle_gap", 0))
         alt_job_wait = int(best_alt.get("job_wait", 0))
-        alt_next2_machine = int(best_alt.get("next2_machine", -1))
-        alt_next2_proc = int(best_alt.get("next2_proc_time", 0))
+        alt_post_route = _format_route_tokens(best_alt.get("post_route_tokens", []))
         chosen_idle_gap = int(
             next(
                 (
@@ -615,8 +622,7 @@ def _build_reflection_memory(current_makespan: int, critical_steps):
                 f"start={chosen_start}, idle_gap={chosen_idle_gap}, job_wait={chosen_job_wait}. "
                 f"Prefer {alt_code}/Job{alt_job} instead when feasible because it gives "
                 f"est_Cmax={alt_ms}, start={alt_start}, delta_cmax={alt_delta}, "
-                f"idle_gap={alt_idle_gap}, job_wait={alt_job_wait}, and downstream route "
-                f"next2=M{alt_next2_machine}/t={alt_next2_proc}."
+                f"idle_gap={alt_idle_gap}, job_wait={alt_job_wait}, and post_route={alt_post_route}."
             )
         )
     return "\n".join(lines)

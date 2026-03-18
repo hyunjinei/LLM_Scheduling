@@ -216,6 +216,13 @@ class StaticJSSPStepEnv:
         next_op = self.job_next_op[job_id]
         return sum(duration for _, duration in self.inst_for_ortools[job_id][next_op:])
 
+    def _post_route_tokens(self, job_id: int) -> List[str]:
+        next_op = self.job_next_op[job_id] + 1
+        return [
+            f"M{int(machine_id)}:{int(duration)}"
+            for machine_id, duration in self.inst_for_ortools[job_id][next_op:]
+        ]
+
     def _next_operation(self, job_id: int, offset: int = 0) -> Tuple[int, int]:
         op_idx = self.job_next_op[job_id] + int(offset)
         if op_idx >= self.operations_per_job[job_id]:
@@ -244,6 +251,7 @@ class StaticJSSPStepEnv:
         remaining_work: List[int] = []
         remaining_work_ratio: List[float] = []
         job_progress_ratio: List[float] = []
+        post_route_tokens: List[List[str]] = []
 
         for job_id in range(self.num_jobs):
             op_idx = self.job_next_op[job_id]
@@ -265,6 +273,7 @@ class StaticJSSPStepEnv:
             job_progress_ratio.append(
                 float(total_ops - rem_ops) / float(total_ops)
             )
+            post_route_tokens.append(self._post_route_tokens(job_id))
 
         current_cmax = self.get_makespan()
         total_remaining_work = int(sum(remaining_work))
@@ -319,6 +328,7 @@ class StaticJSSPStepEnv:
             "remaining_work": remaining_work,
             "remaining_work_ratio": remaining_work_ratio,
             "job_progress_ratio": job_progress_ratio,
+            "post_route_tokens": post_route_tokens,
             "total_remaining_work": int(total_remaining_work),
             "unfinished_jobs_count": int(unfinished_jobs_count),
             "unfinished_jobs_ratio": float(unfinished_jobs_ratio),
