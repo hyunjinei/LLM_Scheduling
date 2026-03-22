@@ -55,6 +55,7 @@ from llm_jssp.utils.solution_generation_english import (
     read_matrix_form_jssp,
 )
 from llm_jssp.utils.jssp_step_env import StaticJSSPStepEnv
+from llm_jssp.utils.jssp_dispatch_env import DispatchJSSPStepEnv
 from llm_jssp.utils.jssp_step_masking_hooks import (
     build_step_prefix_allowed_tokens_fn,
     StepActionParseError,
@@ -70,6 +71,10 @@ from llm_jssp.utils.step_prompting import (
     build_step_improvement_prompt,
     build_step_prompt,
     compute_action_transition_features,
+)
+from llm_jssp.utils.step_prompting_dispatch import (
+    build_step_prompt as build_dispatch_step_prompt,
+    compute_action_transition_features as compute_dispatch_action_transition_features,
 )
 
 # ---------------------------------------------------------------------------
@@ -146,6 +151,40 @@ def mwkr_schedule(inst_for_ortools: List[List[List[int]]]) -> Tuple[List[Dict], 
 
     makespan = max(job_time) if schedule else float("inf")
     return schedule, makespan
+
+
+def _count_total_ops(inst_for_ortools: List[List[List[int]]]) -> int:
+    return int(sum(len(job_ops) for job_ops in inst_for_ortools))
+
+
+def compute_episode_reward(
+    makespan: float,
+    feasible: bool,
+    inst_for_ortools: List[List[List[int]]],
+    invalid_makespan_penalty: float,
+    reward_mode: str = "raw_neg_makespan",
+    heuristic_makespan: float | None = None,
+) -> float:
+    if not feasible or not math.isfinite(float(makespan)):
+        if reward_mode == "neg_makespan_per_op":
+            total_ops = max(_count_total_ops(inst_for_ortools), 1)
+            return -float(invalid_makespan_penalty) / float(total_ops)
+        if reward_mode == "mwkr_relative":
+            return -1.0
+        return -float(invalid_makespan_penalty)
+
+    makespan = float(makespan)
+    if reward_mode == "raw_neg_makespan":
+        return -makespan
+    if reward_mode == "neg_makespan_per_op":
+        total_ops = max(_count_total_ops(inst_for_ortools), 1)
+        return -(makespan / float(total_ops))
+    if reward_mode == "mwkr_relative":
+        baseline_ms = float(heuristic_makespan) if heuristic_makespan is not None else float(mwkr_schedule(inst_for_ortools)[1])
+        if not math.isfinite(baseline_ms) or baseline_ms <= 0:
+            return -makespan
+        return (baseline_ms - makespan) / baseline_ms
+    raise ValueError(f"Unsupported reward_mode={reward_mode}")
 
 
 def _build_step_chat_prompt(tokenizer, state_text: str) -> str:
@@ -252,8 +291,51 @@ def generate_step_action(
             model.train()
 
 
-def _estimate_action_effects(state_json, action_code_to_job):
+def _normalize_env_mode(env_mode: str) -> str:
+    resolved = str(env_mode).lower()
+    if resolved not in {"serial", "dispatch"}:
+        raise ValueError(f"Unsupported env_mode={env_mode}")
+    return resolved
+
+
+def _make_step_env(inst_for_ortools, env_mode: str):
+    if _normalize_env_mode(env_mode) == "dispatch":
+        return DispatchJSSPStepEnv(inst_for_ortools)
+    return StaticJSSPStepEnv(inst_for_ortools)
+
+
+def _estimate_action_effects(state_json, action_code_to_job, env_mode: str = "serial"):
+    if _normalize_env_mode(env_mode) == "dispatch":
+        return compute_dispatch_action_transition_features(state_json, action_code_to_job)
     return compute_action_transition_features(state_json, action_code_to_job)
+
+
+def _build_state_text(
+    state_json,
+    feasible_jobs,
+    step_idx,
+    total_steps,
+    problem_context_text,
+    action_code_to_job,
+    env_mode: str = "serial",
+):
+    if _normalize_env_mode(env_mode) == "dispatch":
+        return build_dispatch_step_prompt(
+            state_json=state_json,
+            feasible_jobs=feasible_jobs,
+            step_idx=step_idx,
+            total_steps=total_steps,
+            problem_context_text=problem_context_text,
+            action_code_to_job=action_code_to_job,
+        )
+    return build_step_prompt(
+        state_json=state_json,
+        feasible_jobs=feasible_jobs,
+        step_idx=step_idx,
+        total_steps=total_steps,
+        problem_context_text=problem_context_text,
+        action_code_to_job=action_code_to_job,
+    )
 
 
 def _best_alternative_option(step):
@@ -395,6 +477,7 @@ def rollout_step_episode(
     inst_for_ortools: List[List[List[int]]],
     device: torch.device,
     step_action_max_new_tokens: int,
+    env_mode: str = "serial",
     temperature: float = 1.0,
     top_p: float = 0.95,
     top_k: int = 50,
@@ -413,7 +496,7 @@ def rollout_step_episode(
     )
 
     def _rollout_once(code_seed: int, guidance_by_step=None, reflection_memory_text: str | None = None):
-        env = StaticJSSPStepEnv(inst_for_ortools)
+        env = _make_step_env(inst_for_ortools, env_mode)
         env.reset()
         traces: List[StepActionTrace] = []
         step_records = []
@@ -435,16 +518,18 @@ def rollout_step_episode(
                 makespan_before, action_effects = _estimate_action_effects(
                     state_json=state,
                     action_code_to_job=action_code_to_job,
+                    env_mode=env_mode,
                 )
                 effect_by_code = {x["action_code"]: x for x in action_effects}
                 feasible_action_codes = list(action_code_to_job.keys())
-                state_text = build_step_prompt(
+                state_text = _build_state_text(
                     state_json=state,
                     feasible_jobs=feasible_jobs,
                     step_idx=step_idx,
                     total_steps=int(state["total_steps"]),
                     problem_context_text=problem_context_text,
                     action_code_to_job=action_code_to_job,
+                    env_mode=env_mode,
                 )
                 if reflection_memory_text:
                     state_text = (
@@ -828,6 +913,7 @@ def build_bopo_step_pairs(
     min_relative_gap: float = 0.0,
     max_pairs_per_group: int = 256,
     max_step_pairs_per_pair: int = 32,
+    pair_mode: str = "shared_prefix",
 ) -> List[BOPOStepPair]:
     """
     Build BOPO preference pairs from a rollout group.
@@ -836,7 +922,9 @@ def build_bopo_step_pairs(
       1. Keep feasible rollouts only.
       2. Sort by makespan (smaller is better), anchor best rollout.
       3. Pair best vs each loser if relative gap >= threshold.
-      4. For each episode pair, sample aligned step indices to limit cost.
+      4. For each episode pair, either:
+         - sample aligned step indices (`aligned`)
+         - or keep only the first divergence step after shared prefix (`shared_prefix`)
     """
     feasible_rollouts = [
         r
@@ -853,6 +941,17 @@ def build_bopo_step_pairs(
     winner_ms = float(winner["makespan"])
     winner_traces = winner["traces"]
 
+    resolved_pair_mode = str(pair_mode).strip().lower()
+    if resolved_pair_mode not in {"aligned", "shared_prefix"}:
+        raise ValueError(f"Unsupported pair_mode={pair_mode}")
+
+    def _first_divergence_index(w_traces, l_traces):
+        n_steps_local = min(len(w_traces), len(l_traces))
+        for idx in range(n_steps_local):
+            if int(w_traces[idx].chosen_job) != int(l_traces[idx].chosen_job):
+                return idx
+        return None
+
     pairs: List[BOPOStepPair] = []
     for loser in feasible_rollouts[1:]:
         loser_ms = float(loser["makespan"])
@@ -867,11 +966,17 @@ def build_bopo_step_pairs(
         if n_steps <= 0:
             continue
 
-        indices = list(range(n_steps))
-        max_steps = int(max_step_pairs_per_pair)
-        if max_steps > 0 and n_steps > max_steps:
-            picked = rng.choice(n_steps, size=max_steps, replace=False)
-            indices = [int(x) for x in picked.tolist()]
+        if resolved_pair_mode == "shared_prefix":
+            div_idx = _first_divergence_index(winner_traces, loser_traces)
+            if div_idx is None:
+                continue
+            indices = [int(div_idx)]
+        else:
+            indices = list(range(n_steps))
+            max_steps = int(max_step_pairs_per_pair)
+            if max_steps > 0 and n_steps > max_steps:
+                picked = rng.choice(n_steps, size=max_steps, replace=False)
+                indices = [int(x) for x in picked.tolist()]
 
         for step_idx in indices:
             w_trace = winner_traces[step_idx]
@@ -1036,6 +1141,10 @@ def run_training(args):
                     matrix_content = example["matrix"]
                     _, _, inst, _ = read_matrix_form_jssp(matrix_content)
 
+                heuristic_makespan = None
+                if args.reward_mode == "mwkr_relative":
+                    _, heuristic_makespan = mwkr_schedule(inst)
+
                 if args.rl_algo == "grpo":
                     group_rollouts = []
                     rewards = []
@@ -1048,6 +1157,7 @@ def run_training(args):
                                 inst_for_ortools=inst,
                                 device=device,
                                 step_action_max_new_tokens=args.step_action_max_new_tokens,
+                                env_mode=args.env_mode,
                                 temperature=args.temperature,
                                 top_p=args.top_p,
                                 top_k=args.top_k,
@@ -1067,10 +1177,13 @@ def run_training(args):
                             traces = []
                             if args.print_step_trace:
                                 print(f"[warn] GRPO rollout parse failed -> penalty applied: {exc}")
-                        reward = (
-                            -makespan
-                            if feasible and math.isfinite(makespan)
-                            else -float(args.invalid_makespan_penalty)
+                        reward = compute_episode_reward(
+                            makespan=makespan,
+                            feasible=bool(feasible),
+                            inst_for_ortools=inst,
+                            invalid_makespan_penalty=float(args.invalid_makespan_penalty),
+                            reward_mode=args.reward_mode,
+                            heuristic_makespan=heuristic_makespan,
                         )
 
                         step_samples = []
@@ -1144,6 +1257,7 @@ def run_training(args):
                                 inst_for_ortools=inst,
                                 device=device,
                                 step_action_max_new_tokens=args.step_action_max_new_tokens,
+                                env_mode=args.env_mode,
                                 temperature=args.temperature,
                                 top_p=args.top_p,
                                 top_k=args.top_k,
@@ -1187,6 +1301,7 @@ def run_training(args):
                         min_relative_gap=args.bopo_min_relative_gap,
                         max_pairs_per_group=args.bopo_max_pairs_per_group,
                         max_step_pairs_per_pair=args.bopo_max_step_pairs_per_pair,
+                        pair_mode=args.bopo_pair_mode,
                     )
                     if not bopo_pairs:
                         t.set_postfix(
@@ -1212,6 +1327,7 @@ def run_training(args):
                             inst_for_ortools=inst,
                             device=device,
                             step_action_max_new_tokens=args.step_action_max_new_tokens,
+                            env_mode=args.env_mode,
                             temperature=args.temperature,
                             top_p=args.top_p,
                             top_k=args.top_k,
@@ -1234,9 +1350,27 @@ def run_training(args):
                         t.set_postfix_str("invalid step rollout, skipping")
                         continue
 
-                    reward = -makespan
-                    _, mwkr_makespan = mwkr_schedule(inst)
-                    baseline = -mwkr_makespan if math.isfinite(mwkr_makespan) else reward
+                    reward = compute_episode_reward(
+                        makespan=makespan,
+                        feasible=bool(feasible),
+                        inst_for_ortools=inst,
+                        invalid_makespan_penalty=float(args.invalid_makespan_penalty),
+                        reward_mode=args.reward_mode,
+                        heuristic_makespan=heuristic_makespan,
+                    )
+                    mwkr_makespan = (
+                        float(heuristic_makespan)
+                        if heuristic_makespan is not None
+                        else float(mwkr_schedule(inst)[1])
+                    )
+                    baseline = compute_episode_reward(
+                        makespan=mwkr_makespan,
+                        feasible=math.isfinite(mwkr_makespan),
+                        inst_for_ortools=inst,
+                        invalid_makespan_penalty=float(args.invalid_makespan_penalty),
+                        reward_mode=args.reward_mode,
+                        heuristic_makespan=mwkr_makespan,
+                    )
                     if args.use_running_baseline:
                         baseline = baseline_tracker.update(reward)
                     advantage = reward - baseline
@@ -1361,7 +1495,9 @@ def parse_args():
     parser.add_argument("--bopo_min_relative_gap", type=float, default=0.0, help="Minimum relative makespan gap to keep a BOPO pair.")
     parser.add_argument("--bopo_max_pairs_per_group", type=int, default=256, help="Maximum BOPO step-pairs generated per rollout group.")
     parser.add_argument("--bopo_max_step_pairs_per_pair", type=int, default=32, help="Maximum aligned step pairs used between winner/loser rollouts.")
+    parser.add_argument("--bopo_pair_mode", type=str, default="shared_prefix", choices=["aligned", "shared_prefix"], help="BOPO pair construction mode.")
     parser.add_argument("--step_action_max_new_tokens", type=int, default=1, help="Max decode length for one step action.")
+    parser.add_argument("--env_mode", type=str, default="serial", choices=["serial", "dispatch"], help="Step environment mode used during rollout.")
     parser.add_argument("--action_code_width", type=int, default=4, help="Fixed digit width in action token (e.g., <A0001>).")
     parser.add_argument("--action_code_seed", type=int, default=42, help="Base seed for randomized action-code mapping.")
     parser.add_argument("--action_code_cap", type=int, default=9999, help="Upper bound of action token pool (sampled sparsely per step from [1, cap]).")
@@ -1374,6 +1510,13 @@ def parse_args():
         type=float,
         default=1e6,
         help="Penalty makespan used for infeasible outputs in GRPO reward.",
+    )
+    parser.add_argument(
+        "--reward_mode",
+        type=str,
+        default="raw_neg_makespan",
+        choices=["raw_neg_makespan", "neg_makespan_per_op", "mwkr_relative"],
+        help="Reward normalization mode for RL rollouts.",
     )
     parser.add_argument("--disable_masking", action="store_true", help="Disable decoding-time feasibility masking.")
     parser.add_argument("--print_step_trace", action="store_true", help="Print chosen/not-chosen options and makespan per step.")

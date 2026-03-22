@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .step_prompting import (
@@ -190,6 +191,22 @@ def render_action_transition_line(effect: Dict[str, object]) -> str:
     )
 
 
+def _order_prompt_effects_randomly(
+    state_json: Dict[str, object],
+    action_effects: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    ordered_effects = [dict(effect) for effect in action_effects]
+    seed_material = (
+        f"{int(state_json.get('step_idx', 0))}|"
+        f"{int(state_json.get('current_time', 0))}|"
+        f"{int(state_json.get('current_cmax', 0))}|"
+        + "|".join(sorted(str(effect.get("action_code", "")) for effect in ordered_effects))
+    )
+    rng = random.Random(seed_material)
+    rng.shuffle(ordered_effects)
+    return ordered_effects
+
+
 def build_step_prompt(
     state_json: Dict[str, object],
     feasible_jobs: Sequence[int],
@@ -259,7 +276,8 @@ def build_step_prompt(
                 "Candidate dispatch effects:",
             ]
         )
-        for effect in action_effects:
+        prompt_effects = _order_prompt_effects_randomly(state_json, action_effects)
+        for effect in prompt_effects:
             lines.append(render_action_transition_line(effect))
         lines.extend(
             [

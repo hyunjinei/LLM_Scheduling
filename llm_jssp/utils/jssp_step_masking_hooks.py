@@ -1,6 +1,6 @@
-import math
-from functools import lru_cache
 from typing import Iterable, List, Sequence
+
+from .action_token_utils import action_codes_to_token_ids, token_id_to_action_code
 
 
 class StepActionParseError(ValueError):
@@ -30,40 +30,43 @@ def build_step_prefix_allowed_tokens_fn(
     if not feasible_action_codes:
         raise RuntimeError("No feasible action codes available at this step.")
 
-    vocab_size = int(getattr(tokenizer, "vocab_size", None) or len(tokenizer))
+    feasible_token_ids = tuple(
+        int(token_id)
+        for token_id in action_codes_to_token_ids(tokenizer, feasible_action_codes)
+    )
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
-
-    @lru_cache(maxsize=65536)
-    def decode_suffix(token_id: int) -> str:
-        text = tokenizer.decode([token_id], skip_special_tokens=False)
-        return _normalize_text(text)
 
     def prefix_allowed_tokens_fn(batch_id: int, input_ids) -> List[int]:
         if hasattr(input_ids, "tolist"):
             input_ids = input_ids.tolist()
         generated_ids = input_ids[int(prompt_len) :]
+        if len(generated_ids) == 0:
+            return list(feasible_token_ids)
+
+        chosen_action_code = token_id_to_action_code(
+            tokenizer,
+            int(generated_ids[0]),
+            code_width=code_width,
+        )
+        if (
+            len(generated_ids) == 1
+            and chosen_action_code is not None
+            and str(chosen_action_code) in feasible_action_codes
+            and eos_token_id is not None
+        ):
+            return [int(eos_token_id)]
+
+        if len(generated_ids) == 1 and chosen_action_code is not None and str(chosen_action_code) in feasible_action_codes:
+            return list(feasible_token_ids)
+
         generated_text = _normalize_text(
             tokenizer.decode(generated_ids, skip_special_tokens=False)
         )
-        allowed: List[int] = []
-        exact_match = generated_text in feasible_action_codes
-
-        if exact_match and eos_token_id is not None:
-            allowed.append(int(eos_token_id))
-
-        for token_id in range(vocab_size):
-            suffix = decode_suffix(token_id)
-            if not suffix:
-                continue
-            candidate_text = generated_text + suffix
-            if _is_prefix_of_any(candidate_text, feasible_action_codes):
-                allowed.append(int(token_id))
-
-        if not allowed:
+        if not feasible_token_ids:
             raise RuntimeError(
                 "No valid next tokens for step action generation. "
                 f"generated_text={generated_text!r}, feasible_action_codes={list(feasible_action_codes)}"
             )
-        return allowed
+        return list(feasible_token_ids)
 
     return prefix_allowed_tokens_fn

@@ -1,6 +1,7 @@
 import argparse
 import torch
 import wandb
+import torch.nn as nn
 from unsloth import FastLanguageModel
 from unsloth import is_bfloat16_supported
 import csv
@@ -22,6 +23,132 @@ from llm_jssp.utils.action_token_utils import (
 
 torch.cuda.empty_cache()
 torch.cuda.ipc_collect()
+
+
+class StepSupervisionCollator:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_token_id = (
+            getattr(tokenizer, "pad_token_id", None)
+            if getattr(tokenizer, "pad_token_id", None) is not None
+            else getattr(tokenizer, "eos_token_id", 0)
+        )
+
+    def __call__(self, features):
+        max_len = max(len(feature["input_ids"]) for feature in features)
+        batch = {
+            "input_ids": [],
+            "attention_mask": [],
+            "labels": [],
+            "loss_weights": [],
+            "action_target_mask": [],
+            "feasible_action_ids": [],
+        }
+        max_action_count = max(len(feature.get("feasible_action_ids", [])) for feature in features)
+        for feature in features:
+            seq_len = len(feature["input_ids"])
+            pad_len = max_len - seq_len
+            batch["input_ids"].append(
+                list(feature["input_ids"]) + [int(self.pad_token_id)] * pad_len
+            )
+            batch["attention_mask"].append(
+                list(feature["attention_mask"]) + [0] * pad_len
+            )
+            batch["labels"].append(
+                list(feature["labels"]) + [-100] * pad_len
+            )
+            batch["loss_weights"].append(
+                list(feature["loss_weights"]) + [0.0] * pad_len
+            )
+            batch["action_target_mask"].append(
+                list(feature.get("action_target_mask", [])) + [0] * pad_len
+            )
+            feasible_action_ids = list(feature.get("feasible_action_ids", []))
+            batch["feasible_action_ids"].append(
+                feasible_action_ids + [-1] * (max_action_count - len(feasible_action_ids))
+            )
+        return {
+            "input_ids": torch.tensor(batch["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(batch["attention_mask"], dtype=torch.long),
+            "labels": torch.tensor(batch["labels"], dtype=torch.long),
+            "loss_weights": torch.tensor(batch["loss_weights"], dtype=torch.float32),
+            "action_target_mask": torch.tensor(batch["action_target_mask"], dtype=torch.long),
+            "feasible_action_ids": torch.tensor(batch["feasible_action_ids"], dtype=torch.long),
+        }
+
+
+def _build_step_supervision_trainer(base_cls):
+    class StepSupervisionTrainer(base_cls):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            model_inputs = dict(inputs)
+            labels = model_inputs.pop("labels")
+            loss_weights = model_inputs.pop("loss_weights", None)
+            action_target_mask = model_inputs.pop("action_target_mask", None)
+            feasible_action_ids = model_inputs.pop("feasible_action_ids", None)
+            outputs = model(**model_inputs)
+            logits = outputs.get("logits") if isinstance(outputs, dict) else outputs.logits
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+            token_loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            ).view_as(shift_labels)
+
+            valid_mask = shift_labels.ne(-100)
+            if loss_weights is None:
+                weights = valid_mask.to(token_loss.dtype)
+            else:
+                shift_weights = loss_weights[..., 1:].contiguous().to(token_loss.dtype)
+                weights = shift_weights * valid_mask.to(token_loss.dtype)
+
+            if action_target_mask is not None:
+                shift_action_mask = action_target_mask[..., 1:].contiguous().bool()
+            else:
+                shift_action_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+
+            base_weights = weights * (~shift_action_mask).to(weights.dtype)
+            loss_num = (token_loss * base_weights).sum()
+            denom = base_weights.sum()
+
+            if feasible_action_ids is not None and bool(shift_action_mask.any().item()):
+                action_rows, action_cols = torch.nonzero(shift_action_mask, as_tuple=True)
+                for row_idx, col_idx in zip(action_rows.tolist(), action_cols.tolist()):
+                    row_feasible_ids = feasible_action_ids[row_idx]
+                    row_feasible_ids = row_feasible_ids[row_feasible_ids.ge(0)]
+                    if row_feasible_ids.numel() <= 0:
+                        continue
+                    target_id = int(shift_labels[row_idx, col_idx].item())
+                    target_matches = torch.nonzero(
+                        row_feasible_ids.eq(target_id),
+                        as_tuple=False,
+                    ).view(-1)
+                    if target_matches.numel() <= 0:
+                        continue
+                    candidate_logits = shift_logits[row_idx, col_idx].index_select(
+                        0,
+                        row_feasible_ids.to(shift_logits.device, dtype=torch.long),
+                    )
+                    target_index = target_matches[0].to(
+                        device=shift_logits.device,
+                        dtype=torch.long,
+                    ).view(1)
+                    action_loss = nn.functional.cross_entropy(
+                        candidate_logits.view(1, -1),
+                        target_index,
+                        reduction="sum",
+                    )
+                    action_weight = weights[row_idx, col_idx].to(action_loss.dtype)
+                    loss_num = loss_num + (action_loss * action_weight)
+                    denom = denom + action_weight
+
+            denom = denom.clamp_min(1.0)
+            loss = loss_num / denom
+            return (loss, outputs) if return_outputs else loss
+
+    return StepSupervisionTrainer
 
 def main():
     # Set up argument parser
@@ -76,6 +203,12 @@ def main():
     parser.add_argument('--fp16', type=bool, default=not torch.cuda.is_bf16_supported(), help='Use FP16')
     parser.add_argument('--bf16', type=bool, default=torch.cuda.is_bf16_supported(), help='Use BF16')
     parser.add_argument('--group_by_length', type=bool, default=True, help='Group by length')
+    parser.add_argument(
+        '--action_loss_weight',
+        type=float,
+        default=4.0,
+        help='Weight multiplier applied to the first supervised <Axxxx> assistant token.',
+    )
     parser.add_argument('--report_to', type=str, default='wandb', help='Report to')
     parser.add_argument('--run_name', type=str, default=None, help='Run name')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
@@ -112,6 +245,24 @@ def main():
         type=str,
         default='train_data/jssp_step_train.jsonl',
         help='Path to step dataset JSONL',
+    )
+    parser.add_argument(
+        '--max_train_samples',
+        type=int,
+        default=None,
+        help='Optional cap on train rows after split.',
+    )
+    parser.add_argument(
+        '--max_eval_samples',
+        type=int,
+        default=None,
+        help='Optional cap on eval rows after split.',
+    )
+    parser.add_argument(
+        '--dataset_num_proc',
+        type=int,
+        default=16,
+        help='Number of worker processes used for dataset preprocessing.',
     )
     parser.add_argument(
         '--step_supervision_mode',
@@ -254,6 +405,67 @@ def main():
     dataset = load_dataset("json", data_files=step_dataset_path, split="train")
     print(f"✅ step 데이터 로딩 완료: {len(dataset):,}개")
 
+    def _resolve_instance_keys(hf_dataset):
+        columns = set(hf_dataset.column_names)
+        instance_values = hf_dataset["instance_id"] if "instance_id" in columns else None
+        source_values = hf_dataset["source_index"] if "source_index" in columns else None
+        keys = []
+        for row_idx in range(len(hf_dataset)):
+            instance_id = ""
+            if instance_values is not None:
+                raw_instance_id = instance_values[row_idx]
+                if raw_instance_id is not None:
+                    instance_id = str(raw_instance_id).strip()
+            if instance_id:
+                keys.append(instance_id)
+                continue
+            if source_values is not None:
+                keys.append(f"source_{int(source_values[row_idx])}")
+                continue
+            raise ValueError(
+                "Step dataset must contain either 'instance_id' or 'source_index' for instance-level split."
+            )
+        return keys
+
+    def _ordered_unique(keys):
+        seen = set()
+        ordered = []
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        return ordered
+
+    def _split_indices_by_instance(hf_dataset, test_ratio, split_seed, enable_eval_split):
+        instance_keys = _resolve_instance_keys(hf_dataset)
+        ordered_instances = _ordered_unique(instance_keys)
+        if not ordered_instances:
+            raise ValueError("No instances found for instance-level split.")
+
+        if not enable_eval_split:
+            train_indices = list(range(len(hf_dataset)))
+            return train_indices, [], ordered_instances, []
+
+        shuffled_instances = ordered_instances[:]
+        rng = random.Random(split_seed)
+        rng.shuffle(shuffled_instances)
+        eval_instance_count = max(1, int(round(len(shuffled_instances) * float(test_ratio))))
+        eval_instance_count = min(eval_instance_count, max(1, len(shuffled_instances) - 1))
+        eval_instance_set = set(shuffled_instances[:eval_instance_count])
+
+        train_indices = []
+        eval_indices = []
+        for row_idx, instance_key in enumerate(instance_keys):
+            if instance_key in eval_instance_set:
+                eval_indices.append(row_idx)
+            else:
+                train_indices.append(row_idx)
+
+        train_instance_ids = [iid for iid in ordered_instances if iid not in eval_instance_set]
+        eval_instance_ids = [iid for iid in ordered_instances if iid in eval_instance_set]
+        return train_indices, eval_indices, train_instance_ids, eval_instance_ids
+
     # 🔍 데이터 순서 확인 (첫 5개 문제 크기)
     print("\n📊 현재 데이터 순서 (첫 5개):")
     for i in range(min(5, len(dataset))):
@@ -264,60 +476,71 @@ def main():
         except Exception:
             print(f"   {i+1}: 크기 정보 읽기 실패")
 
-    # 🔥 NEW: 데이터 셔플링 옵션
-    if args.shuffle_data:
-        print(f"\n🔀 데이터 셔플링 중... (seed: {args.shuffle_seed})")
-        dataset = dataset.shuffle(seed=args.shuffle_seed)
-        print("✅ 데이터 셔플링 완료!")
-
-        # 셔플링 후 순서 확인
-        print("\n📊 셔플링 후 데이터 순서 (첫 5개):")
-        for i in range(min(5, len(dataset))):
-            try:
-                n = dataset[i]["num_jobs"]
-                m = dataset[i]["num_machines"]
-                print(f"   {i+1}: {n}x{m} 문제")
-            except Exception:
-                print(f"   {i+1}: 크기 정보 읽기 실패")
-    else:
-        print("\n📋 데이터 셔플링 비활성화 (step dataset 원본 순서 유지)")
-
     test_size = 0.05
-    pre_map_cap_candidates = []
-    if args.max_train_samples is not None:
-        pre_map_cap_candidates.append(math.ceil(int(args.max_train_samples) / (1.0 - test_size)))
-    if args.max_eval_samples is not None and args.evaluation_strategy != "no":
-        pre_map_cap_candidates.append(math.ceil(int(args.max_eval_samples) / test_size))
-    pre_map_cap = max(pre_map_cap_candidates) if pre_map_cap_candidates else None
-    if pre_map_cap is not None:
-        pre_map_cap = min(int(pre_map_cap), len(dataset))
-        print(f"📉 pre-map sample cap applied: {pre_map_cap:,} rows")
-        dataset = dataset.select(range(pre_map_cap))
+    enable_eval = args.evaluation_strategy != "no"
+    train_indices, eval_indices, train_instance_ids, eval_instance_ids = _split_indices_by_instance(
+        dataset,
+        test_ratio=test_size,
+        split_seed=args.seed,
+        enable_eval_split=enable_eval,
+    )
 
-    # step 프롬프트 생성 (토큰화는 SFTTrainer가 담당)
-    from llm_jssp.utils.data_preprocessing_english import create_step_prompt_formats
-    print("🔄 step 프롬프트 시스템 적용중...")
+    train_dataset = dataset.select(train_indices)
+    eval_dataset = dataset.select(eval_indices) if enable_eval else None
+
+    overlap_count = len(set(train_instance_ids) & set(eval_instance_ids))
+    print(
+        f"\n🧩 instance split:"
+        f" train_instances={len(train_instance_ids):,},"
+        f" eval_instances={len(eval_instance_ids):,},"
+        f" overlap={overlap_count}"
+    )
+    print(
+        f"🧩 row counts before map:"
+        f" train_rows={len(train_dataset):,},"
+        f" eval_rows={(len(eval_dataset) if eval_dataset is not None else 0):,}"
+    )
+
+    if args.shuffle_data:
+        print(f"\n🔀 train 데이터 셔플링 중... (seed: {args.shuffle_seed})")
+        train_dataset = train_dataset.shuffle(seed=args.shuffle_seed)
+        print("✅ train 데이터 셔플링 완료!")
+    else:
+        print("\n📋 train 데이터 셔플링 비활성화 (instance split 후 원본 순서 유지)")
+
+    if args.max_train_samples is not None:
+        train_cap = min(int(args.max_train_samples), len(train_dataset))
+        print(f"📉 train sample cap applied: {train_cap:,} rows")
+        train_dataset = train_dataset.select(range(train_cap))
+    if eval_dataset is not None and args.max_eval_samples is not None:
+        eval_cap = min(int(args.max_eval_samples), len(eval_dataset))
+        print(f"📉 eval sample cap applied: {eval_cap:,} rows")
+        eval_dataset = eval_dataset.shuffle(seed=args.seed).select(range(eval_cap))
+
+    # step 프롬프트 + explicit supervision 생성
+    from llm_jssp.utils.data_preprocessing_english import build_step_supervision_example
+    print("🔄 step supervision tokenization 적용중...")
     print(f"   - step supervision mode: {args.step_supervision_mode}")
     _create_prompt_formats = partial(
-        create_step_prompt_formats,
+        build_step_supervision_example,
         tokenizer=tokenizer,
         step_supervision_mode=args.step_supervision_mode,
+        max_length=args.max_seq_length,
+        action_loss_weight=args.action_loss_weight,
     )
-    dataset = dataset.map(
+    train_dataset = train_dataset.map(
         _create_prompt_formats,
         num_proc=max(1, int(args.dataset_num_proc)),
     )
-    print("✅ 프롬프트 생성 완료!")
-    
-    # 간단한 train_test_split
-    split_dataset = dataset.train_test_split(test_size=test_size, seed=args.seed)
-    
-    # SFTTrainer가 토큰화 담당 (text 필드 사용)
-    train_dataset = split_dataset['train']
-    eval_dataset = split_dataset['test']
+    if eval_dataset is not None:
+        eval_dataset = eval_dataset.map(
+            _create_prompt_formats,
+            num_proc=max(1, int(args.dataset_num_proc)),
+        )
+    print("✅ supervision tokenization 완료!")
 
     print("train_dataset length : ", len(train_dataset))
-    print("eval_dataset length : ", len(eval_dataset))
+    print("eval_dataset length : ", len(eval_dataset) if eval_dataset is not None else 0)
 
     # 프롬프트 샘플 확인
     print("\n🔍 프롬프트 샘플 (첫 500자):")
@@ -325,6 +548,12 @@ def main():
         sample_text = train_dataset[0]["text"][:500]
         print(f"{sample_text}...")
         print(f"📏 프롬프트 길이: {len(train_dataset[0]['text'])} 문자")
+        print(
+            "🎯 supervision stats:"
+            f" prompt_tokens={train_dataset[0].get('prompt_token_count', 'n/a')},"
+            f" assistant_tokens={train_dataset[0].get('assistant_token_count', 'n/a')},"
+            f" supervised_tokens={train_dataset[0].get('supervised_token_count', 'n/a')}"
+        )
     else:
         print("❌ 'text' 필드가 없습니다!")
         print(f"🔍 사용 가능한 필드: {list(train_dataset[0].keys())}")
@@ -419,21 +648,20 @@ def main():
         TrainingArguments = UnslothTrainingArguments
         print("Training with UnslothTrainer")
     else:
-        from trl import SFTTrainer
+        from transformers import Trainer
         from transformers import TrainingArguments
-        Trainer = SFTTrainer
         TrainingArguments = TrainingArguments
-        print("Training with SFTTrainer")
+        print("Training with Trainer")
+
+    Trainer = _build_step_supervision_trainer(Trainer)
+    data_collator = StepSupervisionCollator(tokenizer=tokenizer)
 
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
-        dataset_num_proc=40,
-        packing=False,
+        data_collator=data_collator,
         args=TrainingArguments(
             per_device_train_batch_size=args.per_device_train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -454,11 +682,17 @@ def main():
             greater_is_better=False,
             save_total_limit=args.save_total_limit,
             save_steps=args.save_steps,
-            eval_strategy="steps",
+            eval_strategy=args.evaluation_strategy,
             eval_steps=args.eval_steps,
             per_device_eval_batch_size=args.per_device_eval_batch_size,
-            group_by_length=True,  # 동적 패딩을 위해 명시적으로 설정
+            group_by_length=args.group_by_length,
         ),
+    )
+    print(
+        "🎯 action-centric loss:"
+        f" mode={args.step_supervision_mode},"
+        f" action_weight={float(args.action_loss_weight)},"
+        " supervision=assistant-only/action-targeted+feasible-set-ce"
     )
 
     # =========================

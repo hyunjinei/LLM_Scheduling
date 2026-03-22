@@ -1,10 +1,17 @@
 from functools import partial
 import random
+import re
+from typing import Any, Dict, List, Sequence
 
 try:
     from transformers import AutoTokenizer
 except ImportError:  # pragma: no cover
     AutoTokenizer = object  # type: ignore[misc,assignment]
+
+from llm_jssp.utils.action_token_utils import parse_action_code
+
+
+ACTION_CODE_EXTRACT_RE = re.compile(r"<A\d+>", re.IGNORECASE)
 
 def create_prompt_formats(example, tokenizer):
     """
@@ -118,6 +125,18 @@ def create_step_prompt_formats(example, tokenizer, step_supervision_mode="action
         - state_text
         - target_text
     """
+    messages = build_step_messages(
+        example=example,
+        step_supervision_mode=step_supervision_mode,
+    )
+
+    example["text"] = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    return example
+
+
+def build_step_messages(example, step_supervision_mode="action_only"):
     state_text = str(example.get("state_text", ""))
     reason_input_text = str(example.get("reason_input_text", ""))
     target_text = str(example.get("target_text", ""))
@@ -159,7 +178,6 @@ def create_step_prompt_formats(example, tokenizer, step_supervision_mode="action
         if target_action_reason_text:
             assistant_content = target_action_reason_text
         else:
-            # Backward compatible fallback for older datasets.
             assistant_content = (
                 f"{target_text}\n{reason_target_text}" if reason_target_text else target_text
             )
@@ -188,7 +206,7 @@ def create_step_prompt_formats(example, tokenizer, step_supervision_mode="action
         )
         user_content = state_text
 
-    messages = [
+    return [
         {
             "role": "system",
             "content": system_content,
@@ -203,10 +221,184 @@ def create_step_prompt_formats(example, tokenizer, step_supervision_mode="action
         },
     ]
 
-    example["text"] = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False
+
+def _normalize_token_ids(tokenized_output: Any) -> List[int]:
+    if tokenized_output is None:
+        return []
+    if hasattr(tokenized_output, "tolist"):
+        tokenized_output = tokenized_output.tolist()
+    if isinstance(tokenized_output, tuple):
+        tokenized_output = list(tokenized_output)
+    if isinstance(tokenized_output, list):
+        if tokenized_output and isinstance(tokenized_output[0], list):
+            if len(tokenized_output) != 1:
+                raise ValueError("Expected a single tokenized sequence, got a batch.")
+            tokenized_output = tokenized_output[0]
+        return [int(x) for x in tokenized_output]
+    raise TypeError(f"Unsupported tokenized output type: {type(tokenized_output)!r}")
+
+
+def _collect_action_token_ids(tokenizer) -> List[int]:
+    token_ids = []
+    seen = set()
+    for token in getattr(tokenizer, "additional_special_tokens", []) or []:
+        parsed = parse_action_code(str(token))
+        if parsed is None:
+            continue
+        token_id = tokenizer.convert_tokens_to_ids(str(token))
+        if token_id is None:
+            continue
+        token_id = int(token_id)
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        token_ids.append(token_id)
+    return token_ids
+
+
+def _find_prompt_token_count(tokenizer, prompt_messages, full_ids: Sequence[int]) -> int:
+    prompt_ids = _normalize_token_ids(
+        tokenizer.apply_chat_template(
+            prompt_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
     )
-    return example
+    if list(full_ids[: len(prompt_ids)]) == prompt_ids:
+        return len(prompt_ids)
+
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    if callable(getattr(tokenizer, "__call__", None)):
+        prompt_text_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        prompt_text_ids = [int(x) for x in prompt_text_ids]
+        if list(full_ids[: len(prompt_text_ids)]) == prompt_text_ids:
+            return len(prompt_text_ids)
+
+    raise ValueError(
+        "Could not align prompt and assistant token boundary for step supervision."
+    )
+
+
+def _extract_action_codes(example: Dict[str, Any]) -> List[str]:
+    codes = []
+    raw_codes = example.get("action_codes")
+    if isinstance(raw_codes, list):
+        codes.extend(str(code) for code in raw_codes if str(code).strip())
+    action_code_to_job = example.get("action_code_to_job")
+    if isinstance(action_code_to_job, dict):
+        codes.extend(str(code) for code in action_code_to_job.keys() if str(code).strip())
+    if not codes:
+        state_text = str(example.get("state_text", ""))
+        codes.extend(ACTION_CODE_EXTRACT_RE.findall(state_text))
+    deduped = []
+    seen = set()
+    for code in codes:
+        parsed = parse_action_code(str(code))
+        if parsed is None or parsed in seen:
+            continue
+        seen.add(parsed)
+        deduped.append(parsed)
+    return deduped
+
+
+def build_step_supervision_example(
+    example: Dict[str, Any],
+    tokenizer,
+    step_supervision_mode: str = "action_only",
+    max_length: int | None = None,
+    action_loss_weight: float = 1.0,
+):
+    messages = build_step_messages(
+        example=example,
+        step_supervision_mode=step_supervision_mode,
+    )
+    full_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    full_ids = _normalize_token_ids(
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+    )
+    prompt_len = _find_prompt_token_count(tokenizer, messages[:-1], full_ids)
+    if prompt_len >= len(full_ids):
+        raise ValueError("Assistant span is empty after chat template tokenization.")
+
+    labels = [-100] * len(full_ids)
+    loss_weights = [0.0] * len(full_ids)
+    attention_mask = [1] * len(full_ids)
+    action_target_mask = [0] * len(full_ids)
+    assistant_positions = list(range(prompt_len, len(full_ids)))
+
+    action_token_ids = set(_collect_action_token_ids(tokenizer))
+    feasible_action_ids = []
+    for code in _extract_action_codes(example):
+        token_id = tokenizer.convert_tokens_to_ids(str(code))
+        if token_id is None:
+            continue
+        feasible_action_ids.append(int(token_id))
+    feasible_action_ids = sorted(set(feasible_action_ids))
+    action_position = None
+    if step_supervision_mode in {"action_only", "action_reason"}:
+        for pos in assistant_positions:
+            if int(full_ids[pos]) in action_token_ids:
+                action_position = pos
+                break
+        if action_position is None:
+            raise ValueError(
+                "Could not find action token inside assistant span. "
+                "Check action special-token installation and step targets."
+            )
+
+    if step_supervision_mode == "action_only":
+        labels[action_position] = int(full_ids[action_position])
+        loss_weights[action_position] = float(max(1.0, action_loss_weight))
+        action_target_mask[action_position] = 1
+    elif step_supervision_mode == "action_reason":
+        for pos in assistant_positions:
+            labels[pos] = int(full_ids[pos])
+            loss_weights[pos] = 1.0
+        loss_weights[action_position] = float(max(1.0, action_loss_weight))
+        action_target_mask[action_position] = 1
+    else:
+        for pos in assistant_positions:
+            labels[pos] = int(full_ids[pos])
+            loss_weights[pos] = 1.0
+
+    if max_length is not None and int(max_length) > 0 and len(full_ids) > int(max_length):
+        full_ids = full_ids[: int(max_length)]
+        attention_mask = attention_mask[: int(max_length)]
+        labels = labels[: int(max_length)]
+        loss_weights = loss_weights[: int(max_length)]
+        action_target_mask = action_target_mask[: int(max_length)]
+
+    supervised_token_count = sum(1 for label in labels if int(label) != -100)
+    if supervised_token_count <= 0:
+        raise ValueError(
+            "No supervised assistant tokens remain after truncation. "
+            "Increase max_length or shorten prompts."
+        )
+
+    out = dict(example)
+    out["text"] = full_text
+    out["input_ids"] = [int(x) for x in full_ids]
+    out["attention_mask"] = [int(x) for x in attention_mask]
+    out["labels"] = [int(x) for x in labels]
+    out["loss_weights"] = [float(x) for x in loss_weights]
+    out["action_target_mask"] = [int(x) for x in action_target_mask]
+    out["feasible_action_ids"] = [int(x) for x in feasible_action_ids]
+    out["prompt_token_count"] = int(min(prompt_len, len(full_ids)))
+    out["assistant_token_count"] = int(max(0, len(full_ids) - min(prompt_len, len(full_ids))))
+    out["supervised_token_count"] = int(supervised_token_count)
+    return out
 
 
 def preprocess_batch(batch, tokenizer, max_length):

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from llm_jssp.utils.solution_generation_english import read_matrix_form_jssp
 from llm_jssp.utils.jssp_step_env import StaticJSSPStepEnv
+from llm_jssp.utils.jssp_dispatch_env import DispatchJSSPStepEnv
 from llm_jssp.utils.jssp_masking_hooks import build_prefix_allowed_tokens_fn_from_instance
 from llm_jssp.utils.step_prompting import (
     build_problem_context_text,
@@ -25,6 +26,10 @@ from llm_jssp.utils.step_prompting import (
     build_step_prompt,
     compute_action_transition_features,
     invert_action_code_map,
+)
+from llm_jssp.utils.step_prompting_dispatch import (
+    build_step_prompt as build_dispatch_step_prompt,
+    compute_action_transition_features as compute_dispatch_action_transition_features,
 )
 from llm_jssp.utils.step_reasoning import build_reason_input_text
 from llm_jssp.utils.action_token_utils import (
@@ -102,6 +107,7 @@ parser.add_argument('--action_code_width', type=int, default=4, help='Fixed digi
 parser.add_argument('--action_code_seed', type=int, default=42, help='Base RNG seed for randomized step action-code mapping')
 parser.add_argument('--action_code_cap', type=int, default=9999, help='Upper bound of action token pool (sampled sparsely per step from [1, cap])')
 parser.add_argument('--print_step_trace', action='store_true', default=False, help='Print chosen/not-chosen options and makespan per step')
+parser.add_argument('--env_mode', type=str, default='serial', choices=['serial', 'dispatch'], help='Step environment mode used during rollout.')
 
 def _resolve_base_model_name(model_type: str) -> str:
     model_map = {
@@ -375,7 +381,7 @@ def _clean_step_rationale(
     if "Not chosen:" in reason:
         reason = reason.split("Not chosen:", 1)[0].strip()
 
-    found_codes = re.findall(r"<\s*[sS]\s*\d+\s*>", reason)
+    found_codes = re.findall(r"<\s*[aA]\s*\d+\s*>", reason)
     normalized_codes = {re.sub(r"\s+", "", code).upper() for code in found_codes}
     chosen_norm = re.sub(r"\s+", "", str(chosen_action_code)).upper()
     if any(code != chosen_norm for code in normalized_codes):
@@ -383,14 +389,57 @@ def _clean_step_rationale(
             chosen_action_code, chosen_effect, action_effects
         )
 
-    reason = re.sub(r"<\s*[sS]\s*\d+\s*>", str(chosen_action_code), reason)
+    reason = re.sub(r"<\s*[aA]\s*\d+\s*>", str(chosen_action_code), reason)
     if len(reason) > 220:
         reason = reason[:217].rstrip() + "..."
     return f"{chosen_action_code}: {reason}"
 
 
-def _estimate_action_effects(state_json, action_code_to_job):
+def _normalize_env_mode(env_mode: str) -> str:
+    resolved = str(env_mode).lower()
+    if resolved not in {"serial", "dispatch"}:
+        raise ValueError(f"Unsupported env_mode={env_mode}")
+    return resolved
+
+
+def _make_step_env(inst_for_ortools, env_mode: str):
+    if _normalize_env_mode(env_mode) == "dispatch":
+        return DispatchJSSPStepEnv(inst_for_ortools)
+    return StaticJSSPStepEnv(inst_for_ortools)
+
+
+def _estimate_action_effects(state_json, action_code_to_job, env_mode: str = "serial"):
+    if _normalize_env_mode(env_mode) == "dispatch":
+        return compute_dispatch_action_transition_features(state_json, action_code_to_job)
     return compute_action_transition_features(state_json, action_code_to_job)
+
+
+def _build_state_text(
+    state_json,
+    feasible_jobs,
+    step_idx,
+    total_steps,
+    problem_context_text,
+    action_code_to_job,
+    env_mode: str = "serial",
+):
+    if _normalize_env_mode(env_mode) == "dispatch":
+        return build_dispatch_step_prompt(
+            state_json=state_json,
+            feasible_jobs=feasible_jobs,
+            step_idx=step_idx,
+            total_steps=total_steps,
+            problem_context_text=problem_context_text,
+            action_code_to_job=action_code_to_job,
+        )
+    return build_step_prompt(
+        state_json=state_json,
+        feasible_jobs=feasible_jobs,
+        step_idx=step_idx,
+        total_steps=total_steps,
+        problem_context_text=problem_context_text,
+        action_code_to_job=action_code_to_job,
+    )
 
 
 def _print_step_trace(raw_step_outputs):
@@ -632,6 +681,7 @@ def _run_single_step_rollout(
     model,
     tokenizer,
     inst_for_ortools,
+    env_mode: str = "serial",
     use_masking: bool = True,
     step_action_max_new_tokens: int = 1,
     include_problem_context: bool = True,
@@ -650,7 +700,7 @@ def _run_single_step_rollout(
     replay_prefix_until: int | None = None,
     print_step_trace: bool = False,
 ):
-    env = StaticJSSPStepEnv(inst_for_ortools)
+    env = _make_step_env(inst_for_ortools, env_mode)
     env.reset()
     raw_step_outputs = []
     problem_context_text = (
@@ -673,17 +723,19 @@ def _run_single_step_rollout(
         makespan_before, action_effects = _estimate_action_effects(
             state_json=state,
             action_code_to_job=action_code_to_job,
+            env_mode=env_mode,
         )
         effect_by_code = {x["action_code"]: x for x in action_effects}
         job_to_action_code = invert_action_code_map(action_code_to_job)
         feasible_action_codes = list(action_code_to_job.keys())
-        prompt_state_text = build_step_prompt(
+        prompt_state_text = _build_state_text(
             state_json=state,
             feasible_jobs=feasible_jobs,
             step_idx=step_idx,
             total_steps=state["total_steps"],
             problem_context_text=problem_context_text,
             action_code_to_job=action_code_to_job,
+            env_mode=env_mode,
         )
         if reflection_memory_text:
             prompt_state_text = (
@@ -844,6 +896,7 @@ def run_step_rollout(
     model,
     tokenizer,
     inst_for_ortools,
+    env_mode: str = "serial",
     use_masking: bool = True,
     step_action_max_new_tokens: int = 1,
     include_problem_context: bool = True,
@@ -863,6 +916,7 @@ def run_step_rollout(
         model=model,
         tokenizer=tokenizer,
         inst_for_ortools=inst_for_ortools,
+        env_mode=env_mode,
         use_masking=use_masking,
         step_action_max_new_tokens=step_action_max_new_tokens,
         include_problem_context=include_problem_context,
@@ -1049,6 +1103,7 @@ def run_step_rollout(
             model=model,
             tokenizer=tokenizer,
             inst_for_ortools=inst_for_ortools,
+            env_mode=env_mode,
             use_masking=use_masking,
             step_action_max_new_tokens=step_action_max_new_tokens,
             include_problem_context=include_problem_context,
@@ -1431,6 +1486,7 @@ def evaluate_model_step(
                 inst_for_ortools=inst_for_ortools,
                 use_masking=use_masking,
                 step_action_max_new_tokens=run_args.step_action_max_new_tokens,
+                env_mode=run_args.env_mode,
                 include_problem_context=not run_args.disable_step_problem_context,
                 enable_step_improvement=run_args.enable_step_improvement,
                 step_reflection_passes=run_args.step_reflection_passes,
@@ -1642,7 +1698,7 @@ def run_demo_instance_step(
     print("=" * 80)
     print(
         f"🎯 Step-demo instance {index} — Jobs={n}, Machines={m}, "
-        f"Masking={use_masking}, Context={not run_args.disable_step_problem_context}, "
+        f"EnvMode={run_args.env_mode}, Masking={use_masking}, Context={not run_args.disable_step_problem_context}, "
         f"EpisodeImprovement={run_args.enable_step_improvement}, "
         f"Rationale={run_args.emit_step_rationale}"
     )
@@ -1658,6 +1714,7 @@ def run_demo_instance_step(
             inst_for_ortools=inst_for_ortools,
             use_masking=use_masking,
             step_action_max_new_tokens=run_args.step_action_max_new_tokens,
+            env_mode=run_args.env_mode,
             include_problem_context=not run_args.disable_step_problem_context,
             enable_step_improvement=run_args.enable_step_improvement,
             step_reflection_passes=run_args.step_reflection_passes,
