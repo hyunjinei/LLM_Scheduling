@@ -32,7 +32,6 @@ class JSSPInstanceFSM:
 
         self.batch_states: Dict[int, Dict[str, object]] = {}
         self.allowed_token_ids = self._build_allowed_token_ids()
-        self.fallback_tokens = self._build_fallback_tokens()
         self.eos_token_id = self.tokenizer.eos_token_id
 
     # ----- Public API -----------------------------------------------------
@@ -45,7 +44,7 @@ class JSSPInstanceFSM:
         parse_result = state["parse"]
 
         if not parse_result["valid"]:
-            return self.fallback_tokens
+            raise ValueError("JSSP FSM encountered an invalid partial decode state.")
 
         allowed: List[int] = []
         base_text: str = state["text"]
@@ -62,7 +61,7 @@ class JSSPInstanceFSM:
                 allowed.append(token_id)
 
         if not allowed:
-            return self.fallback_tokens
+            raise ValueError("JSSP FSM found no valid next tokens for the current decode state.")
         return allowed
 
     def update_from_input(self, batch_id: int, input_ids) -> Dict[str, object]:
@@ -149,17 +148,6 @@ class JSSPInstanceFSM:
             tokens.add(self.tokenizer.eos_token_id)
 
         return list(tokens)
-
-    def _build_fallback_tokens(self) -> List[int]:
-        fallback: List[int] = []
-        try:
-            space_tokens = self.tokenizer.encode(" ", add_special_tokens=False)
-        except Exception:
-            space_tokens = []
-        fallback.extend(space_tokens)
-        if self.tokenizer.eos_token_id is not None:
-            fallback.append(self.tokenizer.eos_token_id)
-        return list(dict.fromkeys(fallback)) or [0]
 
     def _decode_token(self, token_id: int) -> Optional[str]:
         try:

@@ -52,14 +52,13 @@ def build_dispatch_teacher_actions(
     Convert serial teacher order into a dispatch-valid decision order.
 
     The raw one-shot teacher order can choose jobs that are not dispatchable at the
-    current event time. To create dispatch supervision, we first reconstruct the
-    target schedule with the serial environment, then replay the same operations in
-    an event-driven dispatch environment using a deterministic tie-break:
+    current event time. To create strict dispatch supervision, we first reconstruct
+    the target schedule with the serial environment, then replay the same operations
+    in an event-driven dispatch environment.
 
-    1. Prefer feasible jobs whose target schedule start_time equals current_time.
-    2. If none exist, choose the feasible job with the earliest target start_time.
-
-    Step 2 is a best-effort fallback for schedules that are not strictly non-delay.
+    At each decision epoch, at least one feasible job must match the target
+    schedule start_time exactly. Otherwise, dispatch supervision generation fails
+    immediately.
     """
     serial_env = StaticJSSPStepEnv(inst_for_ortools)
     serial_env.rollout_teacher(_serial_teacher_job_sequence(teacher_actions))
@@ -102,12 +101,13 @@ def build_dispatch_teacher_actions(
             )
 
         exact_candidates = [item for item in candidates if int(item[0]) == current_time]
-        if exact_candidates:
-            chosen_start, chosen_machine, chosen_job, chosen_op_idx = min(exact_candidates)
-            exact_decisions += 1
-        else:
-            chosen_start, chosen_machine, chosen_job, chosen_op_idx = min(candidates)
-            projected_decisions += 1
+        if not exact_candidates:
+            raise ValueError(
+                "Dispatch teacher rebuild requires an exact feasible match at the current event time. "
+                f"current_time={current_time}, feasible_jobs={feasible_jobs}, candidates={candidates}"
+            )
+        chosen_start, chosen_machine, chosen_job, chosen_op_idx = min(exact_candidates)
+        exact_decisions += 1
 
         dispatch_actions.append(
             ParsedTeacherAction(

@@ -2,6 +2,7 @@ import argparse
 import torch
 import wandb
 import torch.nn as nn
+import numpy as np
 from unsloth import FastLanguageModel
 from unsloth import is_bfloat16_supported
 import csv
@@ -114,11 +115,16 @@ def _build_step_supervision_trainer(base_cls):
             denom = base_weights.sum()
 
             if feasible_action_ids is not None and bool(shift_action_mask.any().item()):
+                matched_action_targets = 0
                 action_rows, action_cols = torch.nonzero(shift_action_mask, as_tuple=True)
                 for row_idx, col_idx in zip(action_rows.tolist(), action_cols.tolist()):
                     row_feasible_ids = feasible_action_ids[row_idx]
                     row_feasible_ids = row_feasible_ids[row_feasible_ids.ge(0)]
                     if row_feasible_ids.numel() <= 0:
+                        raise ValueError(
+                            "Empty feasible_action_ids encountered at an action-supervised position."
+                        )
+                    if row_feasible_ids.numel() < 2:
                         continue
                     target_id = int(shift_labels[row_idx, col_idx].item())
                     target_matches = torch.nonzero(
@@ -126,7 +132,11 @@ def _build_step_supervision_trainer(base_cls):
                         as_tuple=False,
                     ).view(-1)
                     if target_matches.numel() <= 0:
-                        continue
+                        raise ValueError(
+                            "Action target token id was not found inside feasible_action_ids. "
+                            f"target_id={target_id}, feasible_count={int(row_feasible_ids.numel())}, "
+                            f"feasible_head={row_feasible_ids[:8].tolist()}"
+                        )
                     candidate_logits = shift_logits[row_idx, col_idx].index_select(
                         0,
                         row_feasible_ids.to(shift_logits.device, dtype=torch.long),
@@ -143,6 +153,13 @@ def _build_step_supervision_trainer(base_cls):
                     action_weight = weights[row_idx, col_idx].to(action_loss.dtype)
                     loss_num = loss_num + (action_loss * action_weight)
                     denom = denom + action_weight
+                    matched_action_targets += 1
+
+                if matched_action_targets <= 0:
+                    raise ValueError(
+                        "No matched action targets with feasible_count >= 2 contributed "
+                        "to the action-centric loss."
+                    )
 
             denom = denom.clamp_min(1.0)
             loss = loss_num / denom
@@ -189,6 +206,25 @@ def main():
     parser.add_argument('--logging_steps', type=int, default=1, help='Log every X updates steps')
     parser.add_argument('--eval_steps', type=int, default=50, help='Evaluate every X updates steps')
     parser.add_argument('--evaluation_strategy', type=str, default='steps', help='Evaluation strategy')
+    parser.add_argument(
+        '--eval_split_ratio',
+        type=float,
+        default=0.05,
+        help='Instance-level eval split ratio used when evaluation is enabled.',
+    )
+    parser.add_argument(
+        '--eval_split_mode',
+        type=str,
+        default='fixed_per_size',
+        choices=['fixed_per_size', 'ratio'],
+        help='How to select eval instances: fixed count per problem size or global ratio.',
+    )
+    parser.add_argument(
+        '--eval_instances_per_size',
+        type=int,
+        default=3,
+        help='When eval_split_mode=fixed_per_size, hold out this many instances per (num_jobs, num_machines).',
+    )
     parser.add_argument('--load_best_model_at_end', type=bool, default=True, help='Load best model at end')
     parser.add_argument('--metric_for_best_model', type=str, default='eval_loss', help='Metric for best model')
     parser.add_argument('--greater_is_better', type=bool, default=False, help='Greater is better for metric')
@@ -263,6 +299,18 @@ def main():
         type=int,
         default=16,
         help='Number of worker processes used for dataset preprocessing.',
+    )
+    parser.add_argument(
+        '--min_train_feasible_actions',
+        type=int,
+        default=1,
+        help='Keep only train rows whose feasible action count is at least this value.',
+    )
+    parser.add_argument(
+        '--min_eval_feasible_actions',
+        type=int,
+        default=1,
+        help='Keep only eval rows whose feasible action count is at least this value.',
     )
     parser.add_argument(
         '--step_supervision_mode',
@@ -405,26 +453,86 @@ def main():
     dataset = load_dataset("json", data_files=step_dataset_path, split="train")
     print(f"✅ step 데이터 로딩 완료: {len(dataset):,}개")
 
+    def _try_get_source_index_array(hf_dataset):
+        if "source_index" not in set(hf_dataset.column_names):
+            return None
+        arrow_table = getattr(hf_dataset, "_data", None)
+        if arrow_table is not None and hasattr(arrow_table, "column"):
+            try:
+                column = arrow_table.column("source_index")
+                chunks = [
+                    np.asarray(chunk.to_numpy(zero_copy_only=False), dtype=np.int64)
+                    for chunk in getattr(column, "chunks", [])
+                ]
+                if chunks:
+                    return np.concatenate(chunks)
+            except Exception:
+                pass
+        return np.asarray(hf_dataset["source_index"], dtype=np.int64)
+
+    def _try_get_int_array(hf_dataset, column_name):
+        if column_name not in set(hf_dataset.column_names):
+            return None
+        arrow_table = getattr(hf_dataset, "_data", None)
+        if arrow_table is not None and hasattr(arrow_table, "column"):
+            try:
+                column = arrow_table.column(column_name)
+                chunks = [
+                    np.asarray(chunk.to_numpy(zero_copy_only=False), dtype=np.int64)
+                    for chunk in getattr(column, "chunks", [])
+                ]
+                if chunks:
+                    return np.concatenate(chunks)
+            except Exception:
+                pass
+        return np.asarray(hf_dataset[column_name], dtype=np.int64)
+
+    def _count_feasible_actions(example):
+        codes = example.get("feasible_action_codes")
+        if not isinstance(codes, list):
+            raise ValueError(
+                "Step dataset row is missing 'feasible_action_codes' list required for "
+                "min_feasible_actions filtering."
+            )
+        return len(codes)
+
+    def _filter_by_min_feasible_actions(hf_dataset, min_count, split_name):
+        min_count = max(1, int(min_count))
+        if min_count <= 1 or hf_dataset is None:
+            return hf_dataset
+        before_count = len(hf_dataset)
+        hf_dataset = hf_dataset.filter(
+            lambda example: _count_feasible_actions(example) >= min_count,
+            num_proc=max(1, int(args.dataset_num_proc)),
+        )
+        after_count = len(hf_dataset)
+        print(
+            f"🧹 {split_name} feasible-action filter:"
+            f" min_feasible_actions>={min_count},"
+            f" kept={after_count:,}/{before_count:,}"
+        )
+        return hf_dataset
+
     def _resolve_instance_keys(hf_dataset):
         columns = set(hf_dataset.column_names)
-        instance_values = hf_dataset["instance_id"] if "instance_id" in columns else None
-        source_values = hf_dataset["source_index"] if "source_index" in columns else None
-        keys = []
-        for row_idx in range(len(hf_dataset)):
-            instance_id = ""
-            if instance_values is not None:
-                raw_instance_id = instance_values[row_idx]
-                if raw_instance_id is not None:
-                    instance_id = str(raw_instance_id).strip()
-            if instance_id:
-                keys.append(instance_id)
-                continue
+        if "source_index" in columns:
+            source_values = _try_get_source_index_array(hf_dataset)
             if source_values is not None:
-                keys.append(f"source_{int(source_values[row_idx])}")
-                continue
+                return [f"source_{int(x)}" for x in source_values.tolist()]
+
+        instance_values = hf_dataset["instance_id"] if "instance_id" in columns else None
+        keys = []
+        if instance_values is None:
             raise ValueError(
                 "Step dataset must contain either 'instance_id' or 'source_index' for instance-level split."
             )
+        for raw_instance_id in instance_values:
+            instance_id = "" if raw_instance_id is None else str(raw_instance_id).strip()
+            if not instance_id:
+                raise ValueError(
+                    "Empty instance_id encountered and source_index is unavailable for instance-level split."
+                )
+            keys.append(instance_id)
         return keys
 
     def _ordered_unique(keys):
@@ -437,7 +545,72 @@ def main():
             ordered.append(key)
         return ordered
 
-    def _split_indices_by_instance(hf_dataset, test_ratio, split_seed, enable_eval_split):
+    def _split_indices_by_instance(
+        hf_dataset,
+        test_ratio,
+        split_seed,
+        enable_eval_split,
+        split_mode="fixed_per_size",
+        eval_instances_per_size=3,
+    ):
+        source_values = _try_get_source_index_array(hf_dataset)
+        if source_values is not None and source_values.size > 0:
+            ordered_pos = np.sort(np.unique(source_values, return_index=True)[1])
+            ordered_sources = source_values[ordered_pos].tolist()
+            ordered_instances = [f"source_{int(x)}" for x in ordered_sources]
+            if not enable_eval_split:
+                train_indices = np.arange(len(source_values), dtype=np.int64).tolist()
+                return train_indices, [], ordered_instances, []
+
+            resolved_split_mode = str(split_mode).lower()
+            rng = random.Random(split_seed)
+            if resolved_split_mode == "fixed_per_size":
+                num_jobs_values = _try_get_int_array(hf_dataset, "num_jobs")
+                num_machines_values = _try_get_int_array(hf_dataset, "num_machines")
+                if num_jobs_values is None or num_machines_values is None:
+                    raise ValueError(
+                        "fixed_per_size eval split requires 'num_jobs' and 'num_machines' columns."
+                    )
+                ordered_num_jobs = num_jobs_values[ordered_pos].tolist()
+                ordered_num_machines = num_machines_values[ordered_pos].tolist()
+                size_to_sources = defaultdict(list)
+                ordered_sizes = []
+                seen_sizes = set()
+                for source_idx, n_jobs, n_machines in zip(
+                    ordered_sources,
+                    ordered_num_jobs,
+                    ordered_num_machines,
+                ):
+                    size_key = (int(n_jobs), int(n_machines))
+                    if size_key not in seen_sizes:
+                        seen_sizes.add(size_key)
+                        ordered_sizes.append(size_key)
+                    size_to_sources[size_key].append(int(source_idx))
+                eval_sources = []
+                per_size = max(1, int(eval_instances_per_size))
+                for size_key in ordered_sizes:
+                    candidates = list(size_to_sources[size_key])
+                    rng.shuffle(candidates)
+                    eval_sources.extend(candidates[: min(per_size, len(candidates))])
+            else:
+                shuffled_sources = ordered_sources[:]
+                rng.shuffle(shuffled_sources)
+                eval_instance_count = max(1, int(round(len(shuffled_sources) * float(test_ratio))))
+                eval_instance_count = min(eval_instance_count, max(1, len(shuffled_sources) - 1))
+                eval_sources = shuffled_sources[:eval_instance_count]
+
+            eval_source_set = {int(x) for x in eval_sources}
+            eval_mask = np.isin(source_values, np.asarray(eval_sources, dtype=np.int64))
+            train_indices = np.flatnonzero(~eval_mask).astype(np.int64).tolist()
+            eval_indices = np.flatnonzero(eval_mask).astype(np.int64).tolist()
+            train_instance_ids = [
+                f"source_{int(x)}" for x in ordered_sources if int(x) not in eval_source_set
+            ]
+            eval_instance_ids = [
+                f"source_{int(x)}" for x in ordered_sources if int(x) in eval_source_set
+            ]
+            return train_indices, eval_indices, train_instance_ids, eval_instance_ids
+
         instance_keys = _resolve_instance_keys(hf_dataset)
         ordered_instances = _ordered_unique(instance_keys)
         if not ordered_instances:
@@ -476,13 +649,15 @@ def main():
         except Exception:
             print(f"   {i+1}: 크기 정보 읽기 실패")
 
-    test_size = 0.05
+    test_size = max(0.0, min(0.99, float(args.eval_split_ratio)))
     enable_eval = args.evaluation_strategy != "no"
     train_indices, eval_indices, train_instance_ids, eval_instance_ids = _split_indices_by_instance(
         dataset,
         test_ratio=test_size,
         split_seed=args.seed,
         enable_eval_split=enable_eval,
+        split_mode=args.eval_split_mode,
+        eval_instances_per_size=args.eval_instances_per_size,
     )
 
     train_dataset = dataset.select(train_indices)
@@ -491,6 +666,7 @@ def main():
     overlap_count = len(set(train_instance_ids) & set(eval_instance_ids))
     print(
         f"\n🧩 instance split:"
+        f" mode={args.eval_split_mode},"
         f" train_instances={len(train_instance_ids):,},"
         f" eval_instances={len(eval_instance_ids):,},"
         f" overlap={overlap_count}"
@@ -500,6 +676,18 @@ def main():
         f" train_rows={len(train_dataset):,},"
         f" eval_rows={(len(eval_dataset) if eval_dataset is not None else 0):,}"
     )
+
+    train_dataset = _filter_by_min_feasible_actions(
+        train_dataset,
+        args.min_train_feasible_actions,
+        "train",
+    )
+    if eval_dataset is not None:
+        eval_dataset = _filter_by_min_feasible_actions(
+            eval_dataset,
+            args.min_eval_feasible_actions,
+            "eval",
+        )
 
     if args.shuffle_data:
         print(f"\n🔀 train 데이터 셔플링 중... (seed: {args.shuffle_seed})")

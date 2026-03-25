@@ -8,10 +8,8 @@ try:
 except ImportError:  # pragma: no cover
     AutoTokenizer = object  # type: ignore[misc,assignment]
 
-from llm_jssp.utils.action_token_utils import parse_action_code
+from llm_jssp.utils.action_token_utils import action_code_to_token_id, parse_action_code
 
-
-ACTION_CODE_EXTRACT_RE = re.compile(r"<A\d+>", re.IGNORECASE)
 
 def create_prompt_formats(example, tokenizer):
     """
@@ -149,15 +147,11 @@ def build_step_messages(example, step_supervision_mode="action_only"):
         )
 
     if step_supervision_mode == "reason_only":
-        user_content = reason_input_text or state_text
-        if not user_content:
-            raise ValueError("Missing 'reason_input_text'/'state_text' for reason dataset sample.")
-        if not reason_target_text:
-            legacy_reason_text = str(example.get("target_reason_text", "")).strip()
-            if legacy_reason_text:
-                reason_target_text = legacy_reason_text
+        if not reason_input_text:
+            raise ValueError("Missing 'reason_input_text' for reason dataset sample.")
         if not reason_target_text:
             raise ValueError("Missing 'reason_target_text' for reason dataset sample.")
+        user_content = reason_input_text
         assistant_content = reason_target_text
         system_content = (
             "You are an expert JSSP scheduling analyst. "
@@ -172,15 +166,10 @@ def build_step_messages(example, step_supervision_mode="action_only"):
     elif step_supervision_mode == "action_reason":
         if not state_text:
             raise ValueError("Missing 'state_text' for step dataset sample.")
-        if not target_text:
-            raise ValueError("Missing 'target_text' for step dataset sample.")
         target_action_reason_text = str(example.get("target_action_reason_text", "")).strip()
-        if target_action_reason_text:
-            assistant_content = target_action_reason_text
-        else:
-            assistant_content = (
-                f"{target_text}\n{reason_target_text}" if reason_target_text else target_text
-            )
+        if not target_action_reason_text:
+            raise ValueError("Missing 'target_action_reason_text' for mixed step dataset sample.")
+        assistant_content = target_action_reason_text
         system_content = (
             "You are an expert JSSP scheduler. "
             "Primary objective: minimize final makespan (Cmax). "
@@ -239,20 +228,26 @@ def _normalize_token_ids(tokenized_output: Any) -> List[int]:
 
 
 def _collect_action_token_ids(tokenizer) -> List[int]:
+    cached = getattr(tokenizer, "_cached_action_token_ids", None)
+    if cached is not None:
+        return list(cached)
+
     token_ids = []
     seen = set()
     for token in getattr(tokenizer, "additional_special_tokens", []) or []:
         parsed = parse_action_code(str(token))
         if parsed is None:
             continue
-        token_id = tokenizer.convert_tokens_to_ids(str(token))
-        if token_id is None:
+        try:
+            token_id = action_code_to_token_id(tokenizer, str(token))
+        except Exception:
             continue
         token_id = int(token_id)
         if token_id in seen:
             continue
         seen.add(token_id)
         token_ids.append(token_id)
+    setattr(tokenizer, "_cached_action_token_ids", tuple(token_ids))
     return token_ids
 
 
@@ -292,8 +287,10 @@ def _extract_action_codes(example: Dict[str, Any]) -> List[str]:
     if isinstance(action_code_to_job, dict):
         codes.extend(str(code) for code in action_code_to_job.keys() if str(code).strip())
     if not codes:
-        state_text = str(example.get("state_text", ""))
-        codes.extend(ACTION_CODE_EXTRACT_RE.findall(state_text))
+        raise ValueError(
+            "Missing structured action code metadata in step example. "
+            "Expected `action_codes` or `action_code_to_job`."
+        )
     deduped = []
     seen = set()
     for code in codes:
@@ -316,11 +313,6 @@ def build_step_supervision_example(
         example=example,
         step_supervision_mode=step_supervision_mode,
     )
-    full_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
     full_ids = _normalize_token_ids(
         tokenizer.apply_chat_template(
             messages,
@@ -341,8 +333,9 @@ def build_step_supervision_example(
     action_token_ids = set(_collect_action_token_ids(tokenizer))
     feasible_action_ids = []
     for code in _extract_action_codes(example):
-        token_id = tokenizer.convert_tokens_to_ids(str(code))
-        if token_id is None:
+        try:
+            token_id = action_code_to_token_id(tokenizer, str(code))
+        except Exception:
             continue
         feasible_action_ids.append(int(token_id))
     feasible_action_ids = sorted(set(feasible_action_ids))
@@ -388,7 +381,7 @@ def build_step_supervision_example(
         )
 
     out = dict(example)
-    out["text"] = full_text
+    out["text"] = ""
     out["input_ids"] = [int(x) for x in full_ids]
     out["attention_mask"] = [int(x) for x in attention_mask]
     out["labels"] = [int(x) for x in labels]

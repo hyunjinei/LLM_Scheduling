@@ -97,6 +97,40 @@ class ExponentialBaseline:
         return self.value
 
 
+def summarize_trainable_parameters(model) -> Tuple[int, int, float]:
+    trainable = 0
+    total = 0
+    for param in model.parameters():
+        n = int(param.numel())
+        total += n
+        if param.requires_grad:
+            trainable += n
+    ratio = (float(trainable) / float(total)) if total > 0 else 0.0
+    return trainable, total, ratio
+
+
+def validate_rl_update_mode(model, update_mode: str, model_path: str) -> Tuple[int, int, float]:
+    trainable, total, ratio = summarize_trainable_parameters(model)
+    print(f"[Info] RL trainable params: {trainable:,} / {total:,} ({ratio * 100:.2f}%)")
+
+    if update_mode == "adapter_only":
+        if trainable <= 0:
+            raise ValueError(
+                "RL update mode is adapter_only, but no trainable parameters were found. "
+                f"Check model_path={model_path!r} and adapter loading."
+            )
+    elif update_mode == "full":
+        if trainable <= 0:
+            raise ValueError(
+                "RL update mode is full, but no trainable parameters were found. "
+                f"Check model_path={model_path!r}."
+            )
+    else:
+        raise ValueError(f"Unsupported rl_update_mode={update_mode}")
+
+    return trainable, total, ratio
+
+
 # ---------------------------------------------------------------------------
 # Heuristic baseline (MWKR)
 # ---------------------------------------------------------------------------
@@ -1105,6 +1139,11 @@ def run_training(args):
         model.for_training()
     model.to(device)
     model.train()
+    validate_rl_update_mode(
+        model=model,
+        update_mode=args.rl_update_mode,
+        model_path=args.model_path,
+    )
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -1478,6 +1517,13 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--episodes_per_epoch", type=int, default=2)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument(
+        "--rl_update_mode",
+        type=str,
+        default="adapter_only",
+        choices=["adapter_only", "full"],
+        help="Which parameters RL is allowed to update. Defaults to adapter_only.",
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--top_k", type=int, default=40)
