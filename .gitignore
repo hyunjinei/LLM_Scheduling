@@ -12,6 +12,15 @@ __pycache__/
 .env.*
 secrets.local.py
 *.local
+*.key
+*.pem
+*.p12
+*.pfx
+token.json
+credentials.json
+.netrc
+.huggingface/
+wandb/
 
 # Generated datasets and preprocessing outputs
 train_data/
@@ -36,6 +45,13 @@ evaluate_*.csv
 output_*.csv
 *.log
 
+# Local legacy archive dumps
+legacy/notebooks_previous/
+legacy/notes_previous/
+legacy/run_artifacts/
+legacy/data_artifacts/
+
 # Misc local files
 .DS_Store
 Thumbs.db
+.codex

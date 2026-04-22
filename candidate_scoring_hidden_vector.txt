@@ -1,0 +1,174 @@
+Candidate-scoring hidden vector 정리
+====================================
+
+1. 핵심 구조
+
+[action_code_add][fix] 방식은 action code를 prompt 안에 사용하지만,
+최종 action을 action token generation으로 고르지 않는다.
+
+현재 step에서 가능한 후보가 3개라면:
+
+    Candidate 1: <A1023> -> Job 0
+    Candidate 2: <A7741> -> Job 1
+    Candidate 3: <A0390> -> Job 2
+
+모델은 각 후보에 대해 별도 query를 만든다.
+
+    현재 JSSP 상태
+    전체 feasible candidate 목록
+    Candidate under evaluation: <A1023> ...
+    <CAND_SCORE>
+
+    현재 JSSP 상태
+    전체 feasible candidate 목록
+    Candidate under evaluation: <A7741> ...
+    <CAND_SCORE>
+
+    현재 JSSP 상태
+    전체 feasible candidate 목록
+    Candidate under evaluation: <A0390> ...
+    <CAND_SCORE>
+
+즉 후보 3개면 forward query도 3개다.
+
+
+2. hidden vector가 무엇인가
+
+Llama 8B의 hidden size는 보통 4096이다.
+각 query를 backbone에 넣으면 token마다 4096차원 hidden vector가 나온다.
+
+우리는 전체 token hidden을 다 쓰지 않고, 각 query의 `<CAND_SCORE>` 위치 hidden vector 하나만 뽑는다.
+
+    h_1 = Candidate 1 query의 <CAND_SCORE> hidden, shape [4096]
+    h_2 = Candidate 2 query의 <CAND_SCORE> hidden, shape [4096]
+    h_3 = Candidate 3 query의 <CAND_SCORE> hidden, shape [4096]
+
+이 hidden vector는 “현재 상태에서 이 후보를 평가한 압축 표현”이다.
+후보 자체, 다른 후보들, 현재 machine/job ready time, cmax 변화, 남은 작업량 등의 정보가 attention을 통해 섞인 결과다.
+
+
+3. score head
+
+현재 코드의 기본 score head는 단일 Linear layer다.
+
+    score = Linear(4096 -> 1)(h)
+
+후보 3개라면:
+
+    s_1 = w dot h_1 + b
+    s_2 = w dot h_2 + b
+    s_3 = w dot h_3 + b
+
+이 값은 raw logit이다. 아직 확률이 아니다.
+
+
+4. 확률화
+
+후보 score들을 softmax에 넣는다.
+
+    p_i = exp(s_i) / sum_j exp(s_j)
+
+예를 들어 score가:
+
+    s = [1.2, 0.1, -0.4]
+
+이면 확률은 대략:
+
+    p = [0.65, 0.22, 0.13]
+
+추론에서 greedy면 p가 가장 큰 후보를 고른다.
+sampling이면 이 확률분포에서 뽑는다.
+
+
+5. SFT loss
+
+teacher가 Candidate 2를 정답으로 골랐다고 하자.
+target index는 1이다.
+
+    target = Candidate 2
+    logits = [s_1, s_2, s_3]
+    loss = CrossEntropy(logits, target_index=1)
+
+즉 수식으로는:
+
+    loss = -log p_2
+
+Candidate 2 확률이 낮으면 loss가 크고,
+Candidate 2 확률이 높으면 loss가 작다.
+
+
+6. 기본 LoRA/SFT에서는 무엇이 업데이트되는가
+
+[action_code_add][fix]colab_02_train_step_lora_full.ipynb의 기본 SFT에서는 보통:
+
+    backbone LoRA adapter
+    candidate_score_head
+
+둘 다 업데이트된다.
+
+따라서 학습은 단순히 Linear head만 바꾸는 것이 아니다.
+backbone이 `<CAND_SCORE>` 위치 hidden vector 자체를 더 좋은 후보 평가 표현으로 만들도록 바뀐다.
+
+이게 중요한 점이다.
+
+    나쁜 후보와 좋은 후보를 구분하기 쉬운 hidden vector를 만들도록 LoRA가 학습됨
+    그 hidden vector를 Linear head가 점수로 변환함
+
+
+7. RL score_head_only에서는 무엇이 다른가
+
+현재 OOM을 피하기 위해 RL에서는 `score_head_only` 모드를 쓸 수 있다.
+
+이 경우:
+
+    backbone/LoRA는 freeze
+    candidate_score_head만 train
+
+따라서 hidden vector h_i는 거의 고정되고,
+Linear weight와 bias만 조금씩 움직인다.
+
+그래서 checkpoint-epoch 간 가중치 차이가 작게 보이는 것이 정상이다.
+4097개 parameter만 바뀌기 때문이다.
+
+
+8. Linear가 이상한가
+
+아니다. 후보 scoring, reranking, reward model, classification head에서
+마지막 hidden vector 위에 Linear layer를 올리는 것은 매우 흔한 구조다.
+
+특히 SFT처럼 backbone LoRA도 같이 학습되는 경우에는 Linear head만으로도 충분히 강하다.
+왜냐하면 복잡한 비선형성은 backbone transformer가 담당하고,
+Linear head는 최종 점수 투영만 담당하기 때문이다.
+
+
+9. MLP head는 언제 유리한가
+
+RL에서 `score_head_only`로 backbone을 freeze하면 hidden vector가 고정된다.
+이때는 Linear만으로 표현력이 부족할 수 있다.
+
+그 경우 다음 구조가 더 유리할 수 있다.
+
+    Linear(4096 -> 1024)
+    GELU
+    Linear(1024 -> 1)
+
+하지만 기존 `candidate_scorer.pt`는 Linear(4096 -> 1) 구조라서
+그냥 MLP로 바꾸면 checkpoint 호환이 깨진다.
+
+안전한 확장 방식은 residual delta 구조다.
+
+    score = old_linear(h) + mlp_delta(h)
+
+그리고 mlp_delta의 마지막 layer를 0으로 초기화하면,
+초기 출력은 기존 Linear scorer와 완전히 동일하다.
+그 다음 RL에서 delta만 조금씩 학습할 수 있다.
+
+
+10. 한 줄 요약
+
+현재 방식은 “LLM이 action token을 생성하는 정책”이 아니라,
+“LLM backbone이 후보별 `<CAND_SCORE>` hidden vector를 만들고,
+candidate_score_head가 각 후보를 점수화해서 rerank하는 정책”이다.
+
+SFT에서는 LoRA와 score head가 함께 학습되고,
+RL score_head_only에서는 score head만 업데이트된다.

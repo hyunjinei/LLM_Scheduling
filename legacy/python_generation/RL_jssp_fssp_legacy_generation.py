@@ -1,13 +1,7 @@
-"""Canonical candidate-scoring RL entrypoint for JSSP.
-
-This file intentionally uses the `[action_code_add][fix]` policy shape:
-action codes are present in prompts, but action selection is performed by
-scoring every feasible candidate with `candidate_score_head`.
-"""
-
 import argparse
 import contextlib
 import csv
+import json
 import math
 import os
 import random
@@ -20,16 +14,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from huggingface_hub import HfApi, hf_hub_download, login, snapshot_download
 from torch.optim import AdamW
-
-try:
-    import bitsandbytes as bnb
-except Exception:
-    bnb = None
 from tqdm import trange
-from unsloth import FastLanguageModel
+from unsloth import FastLanguageModel, PatchFastRL, is_bfloat16_supported
 
 
 @dataclass
@@ -48,9 +37,6 @@ class TrajectorySample:
     old_log_prob: torch.Tensor
     feasible: bool
     makespan: float
-    prompt_text: str = ""
-    feasible_action_codes: Optional[List[str]] = None
-    chosen_action_code: str = ""
 
 
 @dataclass
@@ -64,12 +50,6 @@ class BOPOStepPair:
     relative_gap: float
     winner_makespan: float
     loser_makespan: float
-    winner_prompt_text: str = ""
-    winner_feasible_action_codes: Optional[List[str]] = None
-    winner_action_code: str = ""
-    loser_prompt_text: str = ""
-    loser_feasible_action_codes: Optional[List[str]] = None
-    loser_action_code: str = ""
 
 
 @dataclass
@@ -79,26 +59,20 @@ class StepActionTrace:
     action_token_id: int
     chosen_job: int
     step_idx: int
-    prompt_text: str = ""
-    feasible_action_codes: Optional[List[str]] = None
-    chosen_action_code: str = ""
 
 from llm_jssp.utils.solution_generation_english import (
     read_matrix_form_jssp,
 )
 from llm_jssp.utils.jssp_step_env import StaticJSSPStepEnv
 from llm_jssp.utils.jssp_dispatch_env import DispatchJSSPStepEnv
-from llm_jssp.utils.jssp_step_masking_hooks import StepActionParseError
+from llm_jssp.utils.jssp_step_masking_hooks import (
+    build_step_prefix_allowed_tokens_fn,
+    StepActionParseError,
+)
 from llm_jssp.utils.action_token_utils import (
     ensure_action_special_tokens,
-)
-from llm_jssp.utils.action_code_candidate_scoring import (
-    CANDIDATE_SCORE_TOKEN_DEFAULT,
-    compute_candidate_action_log_prob,
-    ensure_candidate_score_token,
-    infer_module_device,
-    load_candidate_score_head,
-    score_candidate_actions,
+    parse_action_code,
+    token_id_to_action_code,
 )
 from llm_jssp.utils.random_jssp import generate_random_instance
 from llm_jssp.utils.step_prompting import (
@@ -140,6 +114,27 @@ OPERATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+GRPO_CMAX_PATTERN = re.compile(
+    r"cmax\s*:\s*([-+]?\d+(?:\.\d+)?)\s*->\s*([-+]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+GRPO_DELTA_CMAX_PATTERN = re.compile(
+    r"delta_cmax\s*=\s*([-+]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+GRPO_EST_END_PATTERN = re.compile(
+    r"est_end\s*=\s*([-+]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+GRPO_PROC_TIME_PATTERN = re.compile(
+    r"(?:processing\s*time|proc_time)\s*=\s*([-+]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+GRPO_REM_RATIO_PATTERN = re.compile(
+    r"rem_work_after_ratio\s*=\s*([-+]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
 # ---------------------------------------------------------------------------
 # Utility structures
 # ---------------------------------------------------------------------------
@@ -172,80 +167,26 @@ def summarize_trainable_parameters(model) -> Tuple[int, int, float]:
     return trainable, total, ratio
 
 
-def apply_rl_update_mode(model, candidate_score_head, update_mode: str) -> None:
-    if update_mode == "score_head_only":
-        for param in model.parameters():
-            param.requires_grad = False
-        for param in candidate_score_head.parameters():
-            param.requires_grad = True
-        return
+def validate_rl_update_mode(model, update_mode: str, model_path: str) -> Tuple[int, int, float]:
+    trainable, total, ratio = summarize_trainable_parameters(model)
+    print(f"[Info] RL trainable params: {trainable:,} / {total:,} ({ratio * 100:.2f}%)")
 
     if update_mode == "adapter_only":
-        for param in candidate_score_head.parameters():
-            param.requires_grad = True
-        return
-
-    if update_mode == "full":
-        for param in model.parameters():
-            param.requires_grad = True
-        for param in candidate_score_head.parameters():
-            param.requires_grad = True
-        return
-
-    raise ValueError(f"Unsupported rl_update_mode={update_mode}")
-
-
-def validate_rl_update_mode(model, candidate_score_head, update_mode: str, model_path: str) -> Tuple[int, int, float]:
-    model_trainable, model_total, _ = summarize_trainable_parameters(model)
-    head_trainable, head_total, _ = summarize_trainable_parameters(candidate_score_head)
-    trainable = int(model_trainable) + int(head_trainable)
-    total = int(model_total) + int(head_total)
-    ratio = (float(trainable) / float(total)) if total > 0 else 0.0
-    print(
-        "[Info] RL trainable params: "
-        f"{trainable:,} / {total:,} ({ratio * 100:.2f}%) | "
-        f"model={model_trainable:,}, score_head={head_trainable:,}"
-    )
-
-    if update_mode == "adapter_only":
-        if model_trainable <= 0:
+        if trainable <= 0:
             raise ValueError(
-                "RL update mode is adapter_only, but no trainable model parameters were found. "
+                "RL update mode is adapter_only, but no trainable parameters were found. "
                 f"Check model_path={model_path!r} and adapter loading."
             )
     elif update_mode == "full":
-        if model_trainable <= 0:
+        if trainable <= 0:
             raise ValueError(
-                "RL update mode is full, but no trainable model parameters were found. "
+                "RL update mode is full, but no trainable parameters were found. "
                 f"Check model_path={model_path!r}."
-            )
-    elif update_mode == "score_head_only":
-        if model_trainable != 0:
-            raise ValueError(
-                "RL update mode is score_head_only, but model parameters are still trainable. "
-                f"Check model_path={model_path!r}."
-            )
-        if head_trainable <= 0:
-            raise ValueError(
-                "RL update mode is score_head_only, but candidate_score_head has no trainable parameters."
             )
     else:
         raise ValueError(f"Unsupported rl_update_mode={update_mode}")
 
     return trainable, total, ratio
-
-
-def looks_like_local_path(path_or_repo: Optional[str]) -> bool:
-    if not path_or_repo:
-        return False
-    text = os.path.expanduser(str(path_or_repo))
-    if os.path.isabs(text):
-        return True
-    if text.startswith("./") or text.startswith("../") or text.startswith("~/"):
-        return True
-    if re.match(r"^[A-Za-z]:[\/]", text):
-        return True
-    return False
 
 
 def resolve_checkpoint_tag(repo_id: str, checkpoint_tag: Optional[str], token: Optional[str] = None) -> Optional[str]:
@@ -266,8 +207,6 @@ def resolve_model_source(model_path: str, checkpoint_tag: Optional[str] = None, 
     expanded = os.path.expanduser(str(model_path))
     if os.path.exists(expanded):
         return expanded
-    if looks_like_local_path(expanded):
-        raise FileNotFoundError(f"Local model path does not exist: {expanded}")
     resolved_checkpoint = resolve_checkpoint_tag(expanded, checkpoint_tag, token=token)
     if resolved_checkpoint is None:
         return expanded
@@ -330,54 +269,6 @@ def maybe_load_policy_adapter(model, policy_model_path: Optional[str], token: Op
     if hasattr(model, "set_adapter"):
         model.set_adapter("default")
     return True
-
-
-def resolve_candidate_scorer_path(model_source: Optional[str], token: Optional[str] = None) -> Optional[str]:
-    if not model_source:
-        return None
-    expanded = os.path.expanduser(str(model_source))
-    if os.path.exists(expanded):
-        direct = os.path.join(expanded, "candidate_scorer.pt")
-        if os.path.exists(direct):
-            return direct
-        nested = os.path.join(expanded, "final", "candidate_scorer.pt")
-        if os.path.exists(nested):
-            return nested
-        return None
-    api = HfApi(token=token)
-    try:
-        files = set(api.list_repo_files(repo_id=expanded, repo_type="model"))
-    except Exception:
-        return None
-    if "candidate_scorer.pt" in files:
-        return hf_hub_download(
-            repo_id=expanded,
-            repo_type="model",
-            filename="candidate_scorer.pt",
-            token=token,
-        )
-    if "final/candidate_scorer.pt" in files:
-        return hf_hub_download(
-            repo_id=expanded,
-            repo_type="model",
-            filename="final/candidate_scorer.pt",
-            token=token,
-        )
-    return None
-
-
-def save_candidate_scorer(candidate_score_head, save_dir: Path, score_token: str, query_forward_batch_size: int):
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "state_dict": candidate_score_head.state_dict(),
-            "score_token": str(score_token),
-            "policy_head_type": "candidate_scoring",
-            "query_forward_batch_size": int(query_forward_batch_size),
-        },
-        save_dir / "candidate_scorer.pt",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +363,7 @@ def compute_episode_reward(
 
 def force_safe_train_attention_backend(model) -> Dict[str, Optional[float]]:
     """
-    Best-effort switch to an eager / math-only attention backend for custom RL
+    Best-effort switch to an eager / math-only attention backend for legacy custom RL
     updates. Official Unsloth GRPO uses its own trainer path and does not need this.
     """
     info = {
@@ -621,29 +512,268 @@ def extract_problem_instance_from_example(example: Dict) -> List[List[List[int]]
     raise ValueError("Dataset example is missing both prompt_jobs_first and matrix fields.")
 
 
-def resolve_raw_problem_dataset_path(args, hf_token: str = "") -> str:
-    if getattr(args, "dataset_path", None):
-        return os.path.expanduser(str(args.dataset_path))
-    source = str(getattr(args, "dataset_source", "local")).strip().lower()
+def _completion_to_text(completion) -> str:
+    if completion is None:
+        return ""
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, dict):
+        return str(completion.get("content", ""))
+    if isinstance(completion, list):
+        parts = []
+        for item in completion:
+            if isinstance(item, dict):
+                parts.append(str(item.get("content", "")))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(completion)
+
+
+def _normalize_action_code_list(action_codes, code_width: int = 4) -> List[str]:
+    out: List[str] = []
+    for code in list(action_codes or []):
+        text = str(code).strip()
+        parsed = parse_action_code(text, code_width=code_width)
+        out.append(str(parsed or text))
+    return out
+
+
+def _extract_target_action_code(target_text: str, code_width: int = 4) -> Optional[str]:
+    parsed = parse_action_code(str(target_text or ""), code_width=code_width)
+    if parsed is not None:
+        return str(parsed)
+    stripped = str(target_text or "").strip()
+    return stripped if stripped else None
+
+
+def extract_proxy_action_metrics_from_state_text(
+    state_text: str,
+    code_width: int = 4,
+) -> Dict[str, Dict[str, float]]:
+    metrics: Dict[str, Dict[str, float]] = {}
+    for raw_line in str(state_text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("<"):
+            continue
+        code = parse_action_code(line, code_width=code_width)
+        if code is None:
+            continue
+        cmax_match = GRPO_CMAX_PATTERN.search(line)
+        delta_match = GRPO_DELTA_CMAX_PATTERN.search(line)
+        est_end_match = GRPO_EST_END_PATTERN.search(line)
+        proc_match = GRPO_PROC_TIME_PATTERN.search(line)
+        rem_ratio_match = GRPO_REM_RATIO_PATTERN.search(line)
+        metrics[str(code)] = {
+            "action_code": str(code),
+            "cmax_after": float(int(cmax_match.group(2))) if cmax_match else float(10**12),
+            "delta_cmax": float(int(delta_match.group(1))) if delta_match else float(10**12),
+            "est_end": float(int(est_end_match.group(1))) if est_end_match else float(10**12),
+            "proc_time": float(int(proc_match.group(1))) if proc_match else float(10**12),
+            "rem_work_after_ratio": float(rem_ratio_match.group(1)) if rem_ratio_match else 1e9,
+        }
+    ordered = sorted(
+        metrics.values(),
+        key=lambda x: (
+            float(x["cmax_after"]),
+            float(x["delta_cmax"]),
+            float(x["est_end"]),
+            float(x["proc_time"]),
+            str(x["action_code"]),
+        ),
+    )
+    if not ordered:
+        return metrics
+    best_after = float(ordered[0]["cmax_after"])
+    best_delta = float(ordered[0]["delta_cmax"])
+    max_after_gap = max(float(item["cmax_after"]) - best_after for item in ordered)
+    max_delta_gap = max(float(item["delta_cmax"]) - best_delta for item in ordered)
+    denom_rank = max(len(ordered) - 1, 1)
+    for rank, item in enumerate(ordered):
+        after_gap = max(0.0, float(item["cmax_after"]) - best_after)
+        delta_gap = max(0.0, float(item["delta_cmax"]) - best_delta)
+        item["rank"] = float(rank)
+        item["rank_score"] = 1.0 if len(ordered) == 1 else 1.0 - float(rank) / float(denom_rank)
+        item["cmax_gap_score"] = 1.0 - (after_gap / max(max_after_gap, 1.0))
+        item["delta_gap_score"] = 1.0 - (delta_gap / max(max_delta_gap, 1.0))
+    return {str(item["action_code"]): dict(item) for item in ordered}
+
+
+def build_unsloth_grpo_prompt(state_text: str):
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are solving JSSP step-by-step. "
+                "Output exactly one feasible action code like <A1234>. "
+                "Do not explain your answer."
+            ),
+        },
+        {
+            "role": "user",
+            "content": str(state_text),
+        },
+    ]
+
+
+def resolve_grpo_step_dataset_path(args, hf_token: str = "") -> str:
+    if getattr(args, "grpo_dataset_path", None):
+        return os.path.expanduser(str(args.grpo_dataset_path))
+    source = str(getattr(args, "grpo_dataset_source", "hf")).strip().lower()
     if source == "local":
-        return os.path.expanduser(str(getattr(args, "dataset_local_path", "llm_jssp/train.json")))
+        if str(getattr(args, "env_mode", "serial")).strip().lower() == "dispatch":
+            return os.path.expanduser(str(args.grpo_step_dataset_local_path_dispatch))
+        return os.path.expanduser(str(args.grpo_step_dataset_local_path))
     if source != "hf":
-        raise ValueError("dataset_source must be 'hf' or 'local'.")
-    repo_id = str(getattr(args, "dataset_hf_repo"))
-    filename = str(getattr(args, "dataset_hf_file"))
+        raise ValueError("grpo_dataset_source must be 'hf' or 'local'.")
+    if str(getattr(args, "env_mode", "serial")).strip().lower() == "dispatch":
+        repo_id = str(args.grpo_step_dataset_hf_repo_dispatch)
+        filename = str(args.grpo_step_dataset_hf_file_dispatch)
+    else:
+        repo_id = str(args.grpo_step_dataset_hf_repo)
+        filename = str(args.grpo_step_dataset_hf_file)
     return hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=filename, token=hf_token or None)
 
 
-def load_unsloth_model_with_chat_template_fallback(**load_kwargs):
-    try:
-        return FastLanguageModel.from_pretrained(**load_kwargs)
-    except Exception as exc:
-        if "additional_chat_templates" not in str(exc):
-            raise
-        retry_kwargs = dict(load_kwargs)
-        retry_kwargs["local_files_only"] = True
-        print("[Warn] additional_chat_templates 404; retrying with local_files_only=True using cached files.")
-        return FastLanguageModel.from_pretrained(**retry_kwargs)
+def build_unsloth_grpo_step_dataset(args, hf_token: str = ""):
+    dataset_path = resolve_grpo_step_dataset_path(args, hf_token=hf_token)
+    ds = load_dataset("json", data_files=dataset_path)["train"]
+    raw_rows = len(ds)
+    exact_jobs = getattr(args, "rl_num_jobs", None)
+    exact_machines = getattr(args, "rl_num_machines", None)
+    min_jobs = getattr(args, "min_rl_num_jobs", None)
+    min_machines = getattr(args, "min_rl_num_machines", None)
+    min_feasible = int(getattr(args, "grpo_min_feasible_actions", 2) or 2)
+    code_width = int(getattr(args, "action_code_width", 4) or 4)
+    raw_size_counter: Counter = Counter()
+    filtered_size_counter: Counter = Counter()
+    records = []
+    for row in ds:
+        n_jobs = int(row.get("num_jobs", 0) or 0)
+        n_machines = int(row.get("num_machines", 0) or 0)
+        num_feasible = int(row.get("num_feasible_actions", len(row.get("feasible_action_codes", []) or [])) or 0)
+        raw_size_counter[(n_jobs, n_machines)] += 1
+        keep = True
+        if exact_jobs is not None and n_jobs != int(exact_jobs):
+            keep = False
+        if exact_machines is not None and n_machines != int(exact_machines):
+            keep = False
+        if min_jobs is not None and n_jobs < int(min_jobs):
+            keep = False
+        if min_machines is not None and n_machines < int(min_machines):
+            keep = False
+        if num_feasible < min_feasible:
+            keep = False
+        if not keep:
+            continue
+
+        state_text = str(row.get("state_text", "")).strip()
+        feasible_action_codes = _normalize_action_code_list(row.get("feasible_action_codes", []) or [], code_width=code_width)
+        if not state_text or not feasible_action_codes:
+            continue
+        proxy_metrics = extract_proxy_action_metrics_from_state_text(state_text, code_width=code_width)
+        target_action_code = _extract_target_action_code(row.get("target_text", ""), code_width=code_width)
+        records.append(
+            {
+                "prompt": build_unsloth_grpo_prompt(state_text),
+                "state_text": state_text,
+                "feasible_action_codes": list(feasible_action_codes),
+                "proxy_metrics_json": json.dumps(proxy_metrics, ensure_ascii=False),
+                "target_action_code": target_action_code,
+                "instance_id": str(row.get("instance_id", "")),
+                "step_idx": int(row.get("step_idx", 0) or 0),
+                "num_jobs": n_jobs,
+                "num_machines": n_machines,
+                "num_feasible_actions": num_feasible,
+            }
+        )
+        filtered_size_counter[(n_jobs, n_machines)] += 1
+
+    shuffle_seed = getattr(args, "grpo_shuffle_seed", None)
+    if shuffle_seed is not None:
+        rng_local = random.Random(int(shuffle_seed))
+        rng_local.shuffle(records)
+
+    max_rows = getattr(args, "grpo_max_dataset_rows", None)
+    if max_rows is not None:
+        max_rows = int(max_rows)
+        if max_rows > 0:
+            records = records[:max_rows]
+
+    print("[Info] official grpo dataset path:", dataset_path)
+    print("[Info] official grpo raw rows:", raw_rows)
+    print("[Info] official grpo filtered rows:", len(records))
+    print("[Info] official grpo size_dist_top_raw:", raw_size_counter.most_common(10))
+    print("[Info] official grpo size_dist_top_filtered:", filtered_size_counter.most_common(10))
+    print(
+        "[Info] official grpo filter config:",
+        {
+            "rl_num_jobs": exact_jobs,
+            "rl_num_machines": exact_machines,
+            "min_rl_num_jobs": min_jobs,
+            "min_rl_num_machines": min_machines,
+            "grpo_min_feasible_actions": min_feasible,
+            "grpo_max_dataset_rows": max_rows,
+        },
+    )
+    if not records:
+        raise ValueError("No GRPO step rows remain after filtering.")
+    return Dataset.from_list(records), dataset_path
+
+
+def build_unsloth_grpo_reward_functions(args):
+    code_width = int(getattr(args, "action_code_width", 4) or 4)
+    valid_weight = float(getattr(args, "grpo_reward_valid_weight", 1.0))
+    proxy_weight = float(getattr(args, "grpo_reward_proxy_weight", 1.0))
+    teacher_weight = float(getattr(args, "grpo_reward_teacher_weight", 0.25))
+
+    def reward_valid_action(prompts=None, completions=None, feasible_action_codes=None, **kwargs):
+        feasible_lists = feasible_action_codes or kwargs.get("feasible_action_codes") or []
+        rewards = []
+        for completion, feasible in zip(completions or [], feasible_lists):
+            code = parse_action_code(_completion_to_text(completion), code_width=code_width)
+            feasible_set = set(_normalize_action_code_list(feasible, code_width=code_width))
+            if code is None:
+                rewards.append(-1.0 * valid_weight)
+            elif str(code) in feasible_set:
+                rewards.append(1.0 * valid_weight)
+            else:
+                rewards.append(-0.5 * valid_weight)
+        return rewards
+
+    def reward_proxy_quality(prompts=None, completions=None, proxy_metrics_json=None, feasible_action_codes=None, **kwargs):
+        metric_rows = proxy_metrics_json or kwargs.get("proxy_metrics_json") or []
+        rewards = []
+        for completion, metrics_blob in zip(completions or [], metric_rows):
+            code = parse_action_code(_completion_to_text(completion), code_width=code_width)
+            try:
+                metrics = json.loads(metrics_blob or "{}")
+            except Exception:
+                metrics = {}
+            if code is None or str(code) not in metrics:
+                rewards.append(-1.0 * proxy_weight)
+                continue
+            chosen = metrics[str(code)]
+            score = (
+                0.60 * float(chosen.get("cmax_gap_score", 0.0))
+                + 0.25 * float(chosen.get("delta_gap_score", 0.0))
+                + 0.15 * float(chosen.get("rank_score", 0.0))
+            )
+            rewards.append(float(score) * proxy_weight)
+        return rewards
+
+    def reward_teacher_action(prompts=None, completions=None, target_action_code=None, **kwargs):
+        targets = target_action_code or kwargs.get("target_action_code") or []
+        rewards = []
+        for completion, target in zip(completions or [], targets):
+            code = parse_action_code(_completion_to_text(completion), code_width=code_width)
+            rewards.append(float(teacher_weight) if code is not None and target is not None and str(code) == str(target) else 0.0)
+        return rewards
+
+    reward_valid_action.__name__ = "reward_valid_action"
+    reward_proxy_quality.__name__ = "reward_proxy_quality"
+    reward_teacher_action.__name__ = "reward_teacher_action"
+    return [reward_valid_action, reward_proxy_quality, reward_teacher_action]
 
 
 def write_history_csv(path_obj: Path, rows: List[Dict]) -> None:
@@ -701,7 +831,6 @@ def _build_step_improvement_chat_prompt(tokenizer, improvement_prompt_text: str)
 def generate_step_action(
     model,
     tokenizer,
-    candidate_score_head,
     prompt_text: str,
     feasible_action_codes: List[str],
     device: torch.device,
@@ -712,47 +841,60 @@ def generate_step_action(
     use_masking: bool = True,
     action_code_width: int = 4,
     action_code_cap: int = 9999,
-    candidate_score_token: str = CANDIDATE_SCORE_TOKEN_DEFAULT,
-    candidate_scoring_query_forward_batch_size: int = 16,
-    print_candidate_probs: bool = False,
 ) -> Tuple[str, torch.Tensor, int, str]:
     if not feasible_action_codes:
         raise StepActionParseError("No feasible action codes available at this step.")
-    score_result = score_candidate_actions(
-        model=model,
-        tokenizer=tokenizer,
-        candidate_score_head=candidate_score_head,
-        prompt_text=prompt_text,
-        feasible_action_codes=feasible_action_codes,
-        do_sample=True,
-        temperature=float(temperature),
-        code_width=int(action_code_width),
-        score_token=str(candidate_score_token),
-        query_forward_batch_size=int(candidate_scoring_query_forward_batch_size),
-        topk=min(5, len(feasible_action_codes)),
-    )
-    chosen_action_code = str(score_result["chosen_action_code"])
-    if chosen_action_code not in feasible_action_codes:
-        raise StepActionParseError(
-            f"Candidate scorer returned infeasible action. chosen={chosen_action_code}, feasible={list(feasible_action_codes)}"
-        )
-    if bool(print_candidate_probs) and int(score_result["debug_payload"].get("feasible_count", 0)) > 1:
-        print("[RL CANDIDATE PROBE]", score_result["debug_payload"])
 
     prompt_inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
-    sequence_ids = prompt_inputs["input_ids"][0].detach().cpu()
-    prompt_len = int(sequence_ids.numel())
-    chosen_token_id = int(
-        tokenizer.convert_tokens_to_ids(str(chosen_action_code))
-    )
-    synthetic_sequence_ids = torch.cat(
-        [
-            sequence_ids,
-            torch.tensor([chosen_token_id], dtype=sequence_ids.dtype),
-        ],
-        dim=0,
-    )
-    return str(chosen_action_code), synthetic_sequence_ids, prompt_len, str(chosen_action_code)
+    prompt_len = int(prompt_inputs["input_ids"].size(1))
+
+    was_training = model.training
+    model.eval()
+    try:
+        generation_kwargs = dict(
+            **prompt_inputs,
+            max_new_tokens=1 if use_masking else int(max_new_tokens),
+            do_sample=True,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+            return_dict_in_generate=False,
+        )
+
+        if use_masking:
+            generation_kwargs["prefix_allowed_tokens_fn"] = build_step_prefix_allowed_tokens_fn(
+                tokenizer=tokenizer,
+                feasible_action_codes_provider=list(feasible_action_codes),
+                code_width=action_code_width,
+                code_cap=action_code_cap,
+            )
+
+        with torch.no_grad():
+            generated = model.generate(**generation_kwargs)
+
+        sequence_ids = generated[0].detach().cpu()
+        new_ids = sequence_ids[prompt_len:]
+        if new_ids.numel() <= 0:
+            raise StepActionParseError("No action token was generated.")
+
+        chosen_action_code = token_id_to_action_code(
+            tokenizer,
+            int(new_ids[0].item()),
+            code_width=action_code_width,
+        )
+        if chosen_action_code is None:
+            generated_text = tokenizer.decode(new_ids, skip_special_tokens=False).strip()
+            raise StepActionParseError(
+                f"Failed to map generated token to action token. output={generated_text!r}"
+            )
+        if str(chosen_action_code) not in feasible_action_codes:
+            raise StepActionParseError(
+                f"Generated action token is not feasible. parsed={chosen_action_code}, feasible={list(feasible_action_codes)}"
+            )
+        return str(chosen_action_code), sequence_ids, prompt_len, str(chosen_action_code)
+    finally:
+        if was_training:
+            model.train()
 
 
 def _normalize_env_mode(env_mode: str) -> str:
@@ -938,7 +1080,6 @@ def _print_step_trace(step_records):
 def rollout_step_episode(
     model,
     tokenizer,
-    candidate_score_head,
     inst_for_ortools: List[List[List[int]]],
     device: torch.device,
     step_action_max_new_tokens: int,
@@ -954,9 +1095,6 @@ def rollout_step_episode(
     action_code_width: int = 4,
     action_code_seed: int = 42,
     action_code_cap: int = 9999,
-    candidate_score_token: str = CANDIDATE_SCORE_TOKEN_DEFAULT,
-    candidate_scoring_query_forward_batch_size: int = 16,
-    print_candidate_probs_during_rollout: bool = False,
     print_step_trace: bool = False,
 ) -> Tuple[float, bool, List[StepActionTrace]]:
     problem_context_text = (
@@ -1031,7 +1169,6 @@ def rollout_step_episode(
                 chosen_action_code, sequence_ids, prompt_len, _ = generate_step_action(
                     model=model,
                     tokenizer=tokenizer,
-                    candidate_score_head=candidate_score_head,
                     prompt_text=base_prompt,
                     feasible_action_codes=feasible_action_codes,
                     device=device,
@@ -1042,9 +1179,6 @@ def rollout_step_episode(
                     use_masking=use_masking,
                     action_code_width=action_code_width,
                     action_code_cap=action_code_cap,
-                    candidate_score_token=candidate_score_token,
-                    candidate_scoring_query_forward_batch_size=candidate_scoring_query_forward_batch_size,
-                    print_candidate_probs=print_candidate_probs_during_rollout,
                 )
                 chosen_job = int(action_code_to_job[chosen_action_code])
                 chosen_effect = effect_by_code.get(chosen_action_code)
@@ -1062,9 +1196,6 @@ def rollout_step_episode(
                         action_token_id=int(sequence_ids[prompt_len].item()),
                         chosen_job=chosen_job,
                         step_idx=step_idx,
-                        prompt_text=base_prompt,
-                        feasible_action_codes=list(feasible_action_codes),
-                        chosen_action_code=str(chosen_action_code),
                     )
                 )
                 step_records.append(
@@ -1171,7 +1302,6 @@ def rollout_step_episode(
                         suggested_code, _, _, _ = generate_step_action(
                             model=model,
                             tokenizer=tokenizer,
-                            candidate_score_head=candidate_score_head,
                             prompt_text=reflection_prompt,
                             feasible_action_codes=feasible_action_codes,
                             device=device,
@@ -1182,9 +1312,6 @@ def rollout_step_episode(
                             use_masking=use_masking,
                             action_code_width=action_code_width,
                             action_code_cap=action_code_cap,
-                            candidate_score_token=candidate_score_token,
-                            candidate_scoring_query_forward_batch_size=candidate_scoring_query_forward_batch_size,
-                            print_candidate_probs=False,
                         )
                     except StepActionParseError as exc:
                         improvement_notes.append(
@@ -1281,43 +1408,10 @@ def compute_log_prob_mean(
     action_token_id: int,
     device: torch.device,
     require_grad: bool,
-    *,
-    tokenizer=None,
-    candidate_score_head=None,
-    prompt_text: str | None = None,
-    feasible_action_codes: Optional[List[str]] = None,
-    chosen_action_code: str | None = None,
-    temperature: float = 1.0,
-    action_code_width: int = 4,
-    candidate_score_token: str = CANDIDATE_SCORE_TOKEN_DEFAULT,
-    candidate_scoring_query_forward_batch_size: int = 16,
 ) -> torch.Tensor:
     """
     Compute log-probability of the first generated action token only.
     """
-    if (
-        candidate_score_head is not None
-        and tokenizer is not None
-        and prompt_text
-        and feasible_action_codes
-        and chosen_action_code
-    ):
-        model_has_trainable_params = any(bool(p.requires_grad) for p in model.parameters())
-        return compute_candidate_action_log_prob(
-            model=model,
-            tokenizer=tokenizer,
-            candidate_score_head=candidate_score_head,
-            prompt_text=str(prompt_text),
-            feasible_action_codes=list(feasible_action_codes),
-            chosen_action_code=str(chosen_action_code),
-            temperature=float(temperature),
-            code_width=int(action_code_width),
-            score_token=str(candidate_score_token),
-            query_forward_batch_size=int(candidate_scoring_query_forward_batch_size),
-            require_grad=bool(require_grad),
-            detach_backbone=bool(require_grad) and (not bool(model_has_trainable_params)),
-        )
-
     seq = sequence_ids[:prompt_len].unsqueeze(0).to(device)
     action_token_id = int(action_token_id)
     forward_kwargs = {
@@ -1378,18 +1472,12 @@ def reinforce_step(
 def grpo_step(
     samples: List[TrajectorySample],
     model,
-    tokenizer,
-    candidate_score_head,
     optimizer: AdamW,
     device: torch.device,
     clip_epsilon: float = 0.2,
     grpo_epochs: int = 1,
     kl_coef: float = 0.0,
     update_batch_size: int = 4,
-    temperature: float = 1.0,
-    action_code_width: int = 4,
-    candidate_score_token: str = CANDIDATE_SCORE_TOKEN_DEFAULT,
-    candidate_scoring_query_forward_batch_size: int = 16,
 ) -> Tuple[float, float]:
     """
     PPO-style clipped policy update with group-normalized advantages.
@@ -1422,15 +1510,6 @@ def grpo_step(
                     action_token_id=s.action_token_id,
                     device=device,
                     require_grad=True,
-                    tokenizer=tokenizer,
-                    candidate_score_head=candidate_score_head,
-                    prompt_text=s.prompt_text,
-                    feasible_action_codes=list(s.feasible_action_codes or []),
-                    chosen_action_code=s.chosen_action_code,
-                    temperature=float(temperature),
-                    action_code_width=int(action_code_width),
-                    candidate_score_token=str(candidate_score_token),
-                    candidate_scoring_query_forward_batch_size=int(candidate_scoring_query_forward_batch_size),
                 )
                 current_log_probs.append(log_prob)
             current_log_probs = torch.stack(current_log_probs)
@@ -1571,12 +1650,6 @@ def build_bopo_step_pairs(
                     relative_gap=float(rel_gap),
                     winner_makespan=float(winner_ms),
                     loser_makespan=float(loser_ms),
-                    winner_prompt_text=str(w_trace.prompt_text),
-                    winner_feasible_action_codes=list(w_trace.feasible_action_codes or []),
-                    winner_action_code=str(w_trace.chosen_action_code),
-                    loser_prompt_text=str(l_trace.prompt_text),
-                    loser_feasible_action_codes=list(l_trace.feasible_action_codes or []),
-                    loser_action_code=str(l_trace.chosen_action_code),
                 )
             )
 
@@ -1591,18 +1664,12 @@ def build_bopo_step_pairs(
 def bopo_step(
     pairs: List[BOPOStepPair],
     model,
-    tokenizer,
-    candidate_score_head,
     optimizer: AdamW,
     device: torch.device,
     beta: float = 2.0,
     gap_scale: float = 3.0,
     margin: float = 0.0,
     update_batch_size: int = 8,
-    temperature: float = 1.0,
-    action_code_width: int = 4,
-    candidate_score_token: str = CANDIDATE_SCORE_TOKEN_DEFAULT,
-    candidate_scoring_query_forward_batch_size: int = 16,
 ) -> Tuple[float, float, int]:
     """
     BOPO-style pairwise preference optimization.
@@ -1631,15 +1698,6 @@ def bopo_step(
                     action_token_id=p.winner_action_token_id,
                     device=device,
                     require_grad=True,
-                    tokenizer=tokenizer,
-                    candidate_score_head=candidate_score_head,
-                    prompt_text=p.winner_prompt_text,
-                    feasible_action_codes=list(p.winner_feasible_action_codes or []),
-                    chosen_action_code=p.winner_action_code,
-                    temperature=float(temperature),
-                    action_code_width=int(action_code_width),
-                    candidate_score_token=str(candidate_score_token),
-                    candidate_scoring_query_forward_batch_size=int(candidate_scoring_query_forward_batch_size),
                 )
                 lp_l = compute_log_prob_mean(
                     model=model,
@@ -1648,15 +1706,6 @@ def bopo_step(
                     action_token_id=p.loser_action_token_id,
                     device=device,
                     require_grad=True,
-                    tokenizer=tokenizer,
-                    candidate_score_head=candidate_score_head,
-                    prompt_text=p.loser_prompt_text,
-                    feasible_action_codes=list(p.loser_feasible_action_codes or []),
-                    chosen_action_code=p.loser_action_code,
-                    temperature=float(temperature),
-                    action_code_width=int(action_code_width),
-                    candidate_score_token=str(candidate_score_token),
-                    candidate_scoring_query_forward_batch_size=int(candidate_scoring_query_forward_batch_size),
                 )
 
                 rel_gap = max(0.0, float(p.relative_gap))
@@ -1695,33 +1744,12 @@ def bopo_step(
 def run_training(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def _enable_rl_memory_savers(module):
-        enabled = []
-        try:
-            if hasattr(module, "gradient_checkpointing_enable"):
-                module.gradient_checkpointing_enable()
-                enabled.append("gradient_checkpointing")
-        except Exception:
-            pass
-        try:
-            if hasattr(module, "enable_input_require_grads"):
-                module.enable_input_require_grads()
-                enabled.append("input_require_grads")
-        except Exception:
-            pass
-        try:
-            config = getattr(module, "config", None)
-            if config is not None and hasattr(config, "use_cache"):
-                config.use_cache = False
-                enabled.append("use_cache=False")
-        except Exception:
-            pass
-        if enabled:
-            print("[Info] RL memory savers:", {"enabled": enabled})
-
-
     if args.hf_token:
         login(token=args.hf_token, add_to_git_credential=False)
+
+    if args.rl_algo == "unsloth_grpo":
+        PatchFastRL("GRPO", FastLanguageModel)
+        print("[Info] official RL backend: unsloth GRPO")
 
     if not args.model_path:
         args.model_path = DEFAULT_MODEL_BY_TYPE[args.model_type]
@@ -1744,7 +1772,11 @@ def run_training(args):
         "dtype": torch.bfloat16 if args.dtype == "bfloat16" else torch.float16,
         "local_files_only": False,
     }
-    model, tokenizer = load_unsloth_model_with_chat_template_fallback(**load_kwargs)
+    if args.rl_algo == "unsloth_grpo":
+        load_kwargs["fast_inference"] = bool(getattr(args, "grpo_use_fast_inference", False))
+        load_kwargs["gpu_memory_utilization"] = float(getattr(args, "grpo_gpu_memory_utilization", 0.6))
+
+    model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
     token_install = ensure_action_special_tokens(
         tokenizer=tokenizer,
         model=model,
@@ -1752,86 +1784,115 @@ def run_training(args):
         code_cap=args.action_code_cap,
     )
     print("[Info] action token install:", token_install)
-    candidate_score_token_install = ensure_candidate_score_token(
-        tokenizer=tokenizer,
-        model=model,
-        token=args.candidate_score_token,
-    )
-    print("[Info] candidate score token install:", candidate_score_token_install)
     if is_adapter:
         maybe_load_policy_adapter(model, resolved_model_path, token=args.hf_token)
         print("[Info] policy adapter loaded")
     if hasattr(model, "for_training"):
         model.for_training()
-    _enable_rl_memory_savers(model)
-    attn_backend_info = force_safe_train_attention_backend(model)
-    print("[Info] RL attention backend:", attn_backend_info)
-    model.train()
-
-    scorer_path = resolve_candidate_scorer_path(resolved_model_path, token=args.hf_token)
-    head_device = infer_module_device(model)
-    head_dtype = next(model.parameters()).dtype
-    if scorer_path and os.path.exists(scorer_path):
-        candidate_score_head, _ = load_candidate_score_head(
-            scorer_path=scorer_path,
-            hidden_size=int(model.config.hidden_size),
-            device=head_device,
-            dtype=head_dtype,
-        )
-        candidate_score_head.train()
-        print("[Info] candidate score head loaded:", scorer_path)
+    if args.rl_algo == "unsloth_grpo":
+        print("[Info] RL attention backend: official unsloth grpo trainer path")
     else:
-        candidate_score_head = torch.nn.Linear(
-            int(model.config.hidden_size),
-            1,
-            bias=True,
-            device=head_device,
-            dtype=head_dtype,
-        )
-        torch.nn.init.normal_(candidate_score_head.weight, mean=0.0, std=0.02)
-        torch.nn.init.zeros_(candidate_score_head.bias)
-        candidate_score_head.train()
-        print("[Info] candidate score head initialized from scratch")
-
-    apply_rl_update_mode(
-        model=model,
-        candidate_score_head=candidate_score_head,
-        update_mode=args.rl_update_mode,
-    )
+        attn_backend_info = force_safe_train_attention_backend(model)
+        print("[Info] RL attention backend:", attn_backend_info)
+    model.train()
     validate_rl_update_mode(
         model=model,
-        candidate_score_head=candidate_score_head,
         update_mode=args.rl_update_mode,
         model_path=resolved_model_path,
     )
 
     output_dir = Path(args.output_dir or f"outputs/{args.rl_algo}_{args.env_mode}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    trainable_params = [p for p in model.parameters() if p.requires_grad] + [p for p in candidate_score_head.parameters() if p.requires_grad]
-    if bnb is not None:
-        optimizer = bnb.optim.AdamW8bit(
-            trainable_params,
-            lr=args.learning_rate,
+
+    if args.rl_algo == "unsloth_grpo":
+        try:
+            from unsloth import UnslothGRPOConfig as GRPOConfig
+        except Exception:
+            from trl import GRPOConfig
+        from trl import GRPOTrainer
+
+        grpo_dataset, grpo_dataset_path = build_unsloth_grpo_step_dataset(args, hf_token=args.hf_token or "")
+        reward_funcs = build_unsloth_grpo_reward_functions(args)
+        max_completion_length = int(getattr(args, "grpo_max_completion_length", args.step_action_max_new_tokens) or args.step_action_max_new_tokens)
+        default_prompt_length = max(256, int(args.max_seq_length) - max_completion_length - 32)
+        configured_prompt_length = getattr(args, "grpo_max_prompt_length", None)
+        max_prompt_length = int(configured_prompt_length or default_prompt_length)
+        max_prompt_length = min(max_prompt_length, int(args.max_seq_length) - max_completion_length - 8)
+        if max_prompt_length <= 0:
+            raise ValueError("grpo_max_prompt_length must be smaller than max_seq_length - max_completion_length")
+
+        grpo_num_train_epochs = getattr(args, "grpo_num_train_epochs", None)
+        resolved_num_train_epochs = float(args.epochs if grpo_num_train_epochs in (None, "") else grpo_num_train_epochs)
+
+        grpo_args = GRPOConfig(
+            output_dir=str(output_dir),
+            learning_rate=float(args.learning_rate),
+            per_device_train_batch_size=int(args.grpo_per_device_train_batch_size),
+            gradient_accumulation_steps=int(args.grpo_gradient_accumulation_steps),
+            num_generations=int(args.grpo_num_generations),
+            max_prompt_length=int(max_prompt_length),
+            max_completion_length=int(max_completion_length),
+            num_train_epochs=resolved_num_train_epochs,
+            max_steps=int(args.grpo_max_steps),
+            logging_steps=int(args.grpo_logging_steps),
+            save_steps=int(args.grpo_save_steps),
+            bf16=bool(args.dtype == "bfloat16" and torch.cuda.is_available() and is_bfloat16_supported()),
+            fp16=bool(args.dtype != "bfloat16"),
+            remove_unused_columns=False,
+            report_to=str(args.grpo_report_to),
+            optim=str(args.grpo_optim),
+            weight_decay=float(args.grpo_weight_decay),
+            warmup_ratio=float(args.grpo_warmup_ratio),
+            lr_scheduler_type=str(args.grpo_lr_scheduler_type),
+            max_grad_norm=float(args.grpo_max_grad_norm),
+            seed=int(args.seed),
         )
-        print("[Info] RL optimizer: AdamW8bit")
-    else:
-        optimizer = AdamW(
-            trainable_params,
-            lr=args.learning_rate,
+
+        print(
+            "[Info] official grpo config:",
+            {
+                "train_rows": len(grpo_dataset),
+                "num_generations": int(args.grpo_num_generations),
+                "num_train_epochs": resolved_num_train_epochs,
+                "max_steps": int(args.grpo_max_steps),
+                "max_prompt_length": int(max_prompt_length),
+                "max_completion_length": int(max_completion_length),
+            },
         )
-        print("[Info] RL optimizer: AdamW")
+
+        trainer = GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=reward_funcs,
+            args=grpo_args,
+            train_dataset=grpo_dataset,
+        )
+        resume_ckpt = getattr(args, "resume_from_checkpoint", None) or None
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+        trainer.save_model(str(output_dir))
+        tokenizer.save_pretrained(str(output_dir))
+
+        grpo_log_history = list(getattr(trainer.state, "log_history", []) or [])
+        grpo_log_path = output_dir / "grpo_log_history.csv"
+        if grpo_log_history:
+            write_history_csv(grpo_log_path, grpo_log_history)
+            print("[Info] grpo_log_history_path:", grpo_log_path)
+        else:
+            print("[Info] No GRPO log history found.")
+        print("[Info] official grpo dataset path:", grpo_dataset_path)
+        print("[Info] official grpo train rows:", len(grpo_dataset))
+        print("[Info] training done")
+        print("[Info] output_dir:", output_dir)
+        return
+
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
 
     rng = np.random.default_rng(args.seed)
     use_random = args.use_random_problems
-    sample_without_replacement = (not use_random) and bool(getattr(args, "sample_without_replacement", True))
-    dataset_order: Optional[List[int]] = None
-    dataset_cursor = 0
     if use_random:
         data_split = None
     else:
-        dataset_path = resolve_raw_problem_dataset_path(args, hf_token=args.hf_token or "")
-        print("[Info] rl raw dataset path:", dataset_path)
-        dataset = load_dataset("json", data_files=dataset_path)
+        dataset = load_dataset("json", data_files=args.dataset_path)
         data_split = dataset["train"]
         raw_rows = len(data_split)
         raw_size_counter: Counter = Counter()
@@ -1881,20 +1942,12 @@ def run_training(args):
         )
         if len(data_split) == 0:
             raise ValueError("No RL training problems remain after applying size filters.")
-        if sample_without_replacement:
-            dataset_order = [int(x) for x in rng.permutation(len(data_split)).tolist()]
-            print("[Info] rl dataset sampling mode: without_replacement")
-        else:
-            print("[Info] rl dataset sampling mode: with_replacement")
 
     baseline_tracker = ExponentialBaseline(beta=args.baseline_beta)
     for epoch in range(args.epochs):
         episode_log_probs = []
         episode_advantages = []
-        grpo_updates = 0
-        grpo_loss_total = 0.0
-        grpo_kl_total = 0.0
-        grpo_sample_total = 0
+        grpo_samples: List[TrajectorySample] = []
         bopo_pairs_epoch: List[BOPOStepPair] = []
         bopo_updates = 0
         bopo_loss_total = 0.0
@@ -1911,15 +1964,7 @@ def run_training(args):
                     )
                     inst = instance["inst_for_ortools"]
                 else:
-                    if dataset_order is not None:
-                        if dataset_cursor >= len(dataset_order):
-                            dataset_order = [int(x) for x in rng.permutation(len(data_split)).tolist()]
-                            dataset_cursor = 0
-                            print(f"[Info] rl dataset sampler reshuffled after covering {len(data_split)} unique problems.")
-                        example = data_split[int(dataset_order[dataset_cursor])]
-                        dataset_cursor += 1
-                    else:
-                        example = random.choice(data_split)
+                    example = random.choice(data_split)
                     inst = extract_problem_instance_from_example(example)
 
                 heuristic_makespan = None
@@ -1935,7 +1980,6 @@ def run_training(args):
                             makespan, feasible, traces = rollout_step_episode(
                                 model=model,
                                 tokenizer=tokenizer,
-                                candidate_score_head=candidate_score_head,
                                 inst_for_ortools=inst,
                                 device=device,
                                 step_action_max_new_tokens=args.step_action_max_new_tokens,
@@ -1951,9 +1995,6 @@ def run_training(args):
                                 action_code_width=args.action_code_width,
                                 action_code_seed=rollout_code_seed,
                                 action_code_cap=args.action_code_cap,
-                                candidate_score_token=args.candidate_score_token,
-                                candidate_scoring_query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
-                                print_candidate_probs_during_rollout=args.print_candidate_probs_during_rl,
                                 print_step_trace=args.print_step_trace,
                             )
                         except StepActionParseError as exc:
@@ -1980,15 +2021,6 @@ def run_training(args):
                                 action_token_id=tr.action_token_id,
                                 device=device,
                                 require_grad=False,
-                                tokenizer=tokenizer,
-                                candidate_score_head=candidate_score_head,
-                                prompt_text=tr.prompt_text,
-                                feasible_action_codes=list(tr.feasible_action_codes or []),
-                                chosen_action_code=tr.chosen_action_code,
-                                temperature=args.temperature,
-                                action_code_width=args.action_code_width,
-                                candidate_score_token=args.candidate_score_token,
-                                candidate_scoring_query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
                             ).detach().cpu()
                             step_samples.append(
                                 {
@@ -1996,9 +2028,6 @@ def run_training(args):
                                     "prompt_len": tr.prompt_len,
                                     "action_token_id": int(tr.action_token_id),
                                     "old_log_prob": old_log_prob,
-                                    "prompt_text": str(tr.prompt_text),
-                                    "feasible_action_codes": list(tr.feasible_action_codes or []),
-                                    "chosen_action_code": str(tr.chosen_action_code),
                                 }
                             )
 
@@ -2017,11 +2046,10 @@ def run_training(args):
                     std_r = float(rewards_t.std(unbiased=False).item())
                     denom = std_r + 1e-8
 
-                    group_samples: List[TrajectorySample] = []
                     for rollout in group_rollouts:
                         advantage = (rollout["reward"] - mean_r) / denom
                         for s in rollout["step_samples"]:
-                            group_samples.append(
+                            grpo_samples.append(
                                 TrajectorySample(
                                     sequence_ids=s["sequence_ids"],
                                     prompt_len=s["prompt_len"],
@@ -2031,9 +2059,6 @@ def run_training(args):
                                     old_log_prob=s["old_log_prob"],
                                     feasible=rollout["feasible"],
                                     makespan=rollout["makespan"],
-                                    prompt_text=str(s["prompt_text"]),
-                                    feasible_action_codes=list(s["feasible_action_codes"] or []),
-                                    chosen_action_code=str(s["chosen_action_code"]),
                                 )
                             )
 
@@ -2045,40 +2070,11 @@ def run_training(args):
                         if feasible_makespans
                         else float(args.invalid_makespan_penalty)
                     )
-
-                    if group_samples:
-                        loss_value, approx_kl = grpo_step(
-                            samples=group_samples,
-                            model=model,
-                            tokenizer=tokenizer,
-                            candidate_score_head=candidate_score_head,
-                            optimizer=optimizer,
-                            device=device,
-                            clip_epsilon=args.clip_epsilon,
-                            grpo_epochs=args.grpo_epochs,
-                            kl_coef=args.kl_coef,
-                            update_batch_size=args.grpo_update_batch_size,
-                            temperature=args.temperature,
-                            action_code_width=args.action_code_width,
-                            candidate_score_token=args.candidate_score_token,
-                            candidate_scoring_query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
-                        )
-                        grpo_updates += 1
-                        grpo_loss_total += float(loss_value)
-                        grpo_kl_total += float(approx_kl)
-                        grpo_sample_total += int(len(group_samples))
-                        del group_samples
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
                     t.set_postfix(
                         algo="grpo-episode",
                         best_makespan=f"{best_ms:.1f}",
                         group_reward=f"{mean_r:.1f}",
                     )
-                    del group_rollouts, rewards_t
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                 elif args.rl_algo == "bopo":
                     group_rollouts = []
                     for _group_idx in range(max(2, args.group_size)):
@@ -2087,7 +2083,6 @@ def run_training(args):
                             makespan, feasible, traces = rollout_step_episode(
                                 model=model,
                                 tokenizer=tokenizer,
-                                candidate_score_head=candidate_score_head,
                                 inst_for_ortools=inst,
                                 device=device,
                                 step_action_max_new_tokens=args.step_action_max_new_tokens,
@@ -2103,9 +2098,6 @@ def run_training(args):
                                 action_code_width=args.action_code_width,
                                 action_code_seed=rollout_code_seed,
                                 action_code_cap=args.action_code_cap,
-                                candidate_score_token=args.candidate_score_token,
-                                candidate_scoring_query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
-                                print_candidate_probs_during_rollout=args.print_candidate_probs_during_rl,
                                 print_step_trace=args.print_step_trace,
                             )
                         except StepActionParseError as exc:
@@ -2161,7 +2153,6 @@ def run_training(args):
                         makespan, feasible, traces = rollout_step_episode(
                             model=model,
                             tokenizer=tokenizer,
-                            candidate_score_head=candidate_score_head,
                             inst_for_ortools=inst,
                             device=device,
                             step_action_max_new_tokens=args.step_action_max_new_tokens,
@@ -2177,9 +2168,6 @@ def run_training(args):
                             action_code_width=args.action_code_width,
                             action_code_seed=rollout_code_seed,
                             action_code_cap=args.action_code_cap,
-                            candidate_score_token=args.candidate_score_token,
-                            candidate_scoring_query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
-                            print_candidate_probs_during_rollout=args.print_candidate_probs_during_rl,
                             print_step_trace=args.print_step_trace,
                         )
                     except StepActionParseError as exc:
@@ -2224,15 +2212,6 @@ def run_training(args):
                             action_token_id=tr.action_token_id,
                             device=device,
                             require_grad=True,
-                            tokenizer=tokenizer,
-                            candidate_score_head=candidate_score_head,
-                            prompt_text=tr.prompt_text,
-                            feasible_action_codes=list(tr.feasible_action_codes or []),
-                            chosen_action_code=tr.chosen_action_code,
-                            temperature=args.temperature,
-                            action_code_width=args.action_code_width,
-                            candidate_score_token=args.candidate_score_token,
-                            candidate_scoring_query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
                         )
                         episode_log_probs.append(log_prob)
                         episode_advantages.append(torch.tensor(advantage, device=device))
@@ -2246,15 +2225,22 @@ def run_training(args):
                     )
 
         if args.rl_algo in {"grpo", "grpo_manual", "grpo_episode"}:
-            if int(grpo_updates) <= 0:
+            if not grpo_samples:
                 print("No GRPO samples collected this epoch; skipping update.")
                 continue
-            loss_value = float(grpo_loss_total) / float(max(int(grpo_updates), 1))
-            approx_kl = float(grpo_kl_total) / float(max(int(grpo_updates), 1))
+            loss_value, approx_kl = grpo_step(
+                samples=grpo_samples,
+                model=model,
+                optimizer=optimizer,
+                device=device,
+                clip_epsilon=args.clip_epsilon,
+                grpo_epochs=args.grpo_epochs,
+                kl_coef=args.kl_coef,
+                update_batch_size=args.grpo_update_batch_size,
+            )
             print(
                 f"[Epoch {epoch+1}] GRPO loss: {loss_value:.4f}, "
-                f"approx_kl: {approx_kl:.6f}, samples: {int(grpo_sample_total)}, "
-                f"group_updates: {int(grpo_updates)}"
+                f"approx_kl: {approx_kl:.6f}, samples: {len(grpo_samples)}"
             )
         elif args.rl_algo == "bopo":
             if not bopo_pairs_epoch:
@@ -2263,18 +2249,12 @@ def run_training(args):
             bopo_loss, bopo_gap, pair_updates = bopo_step(
                 pairs=bopo_pairs_epoch,
                 model=model,
-                tokenizer=tokenizer,
-                candidate_score_head=candidate_score_head,
                 optimizer=optimizer,
                 device=device,
                 beta=args.bopo_beta,
                 gap_scale=args.bopo_gap_scale,
                 margin=args.bopo_margin,
                 update_batch_size=args.bopo_update_batch_size,
-                temperature=args.temperature,
-                action_code_width=args.action_code_width,
-                candidate_score_token=args.candidate_score_token,
-                candidate_scoring_query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
             )
             bopo_updates += int(pair_updates)
             bopo_loss_total += float(bopo_loss) * max(int(pair_updates), 1)
@@ -2305,24 +2285,12 @@ def run_training(args):
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)
-            save_candidate_scorer(
-                candidate_score_head=candidate_score_head,
-                save_dir=ckpt_dir,
-                score_token=args.candidate_score_token,
-                query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
-            )
             print(f"[Epoch {epoch+1}] saved: {ckpt_dir}")
 
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
-    save_candidate_scorer(
-        candidate_score_head=candidate_score_head,
-        save_dir=final_dir,
-        score_token=args.candidate_score_token,
-        query_forward_batch_size=args.candidate_scoring_query_forward_batch_size,
-    )
     print("[Info] training done")
     print("[Info] output_dir:", output_dir)
     print("[Info] final_dir:", final_dir)
@@ -2333,9 +2301,9 @@ def run_training(args):
 # ---------------------------------------------------------------------------
 
 
-def build_arg_parser():
-    parser = argparse.ArgumentParser(description="Candidate-scoring policy optimization for JSSP.")
-    parser.add_argument("--max_seq_length", type=int, default=8192, help="Maximum sequence length")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Policy optimization for JSSP (official Unsloth GRPO + legacy manual RL).")
+    parser.add_argument("--max_seq_length", type=int, default=40000, help="Maximum sequence length")
     parser.add_argument("--model_type", type=str, default="llama8b",
                         choices=["llama8b", "llama1b", "qwen2.5_7b", "qwen2.5_14b", "deepseek_8b", "qwen25_7b_math"],
                         help="Base model family (inference-compatible defaults).")
@@ -2352,35 +2320,29 @@ def build_arg_parser():
 
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--episodes_per_epoch", type=int, default=2)
-    parser.add_argument(
-        "--sample_without_replacement",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Sample filtered RL problems without replacement until the filtered pool is exhausted.",
-    )
     parser.add_argument("--save_every_n_epochs", type=int, default=1, help="Save checkpoint every N epochs for manual RL loops.")
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument(
         "--rl_update_mode",
         type=str,
         default="adapter_only",
-        choices=["adapter_only", "score_head_only", "full"],
-        help="Which parameters RL is allowed to update. score_head_only freezes the model and trains only candidate_score_head.",
+        choices=["adapter_only", "full"],
+        help="Which parameters RL is allowed to update. Defaults to adapter_only.",
     )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--top_k", type=int, default=40)
-    parser.add_argument("--max_new_tokens", type=int, default=1, help="Compatibility argument; candidate-scoring action selection does not generate action tokens.")
+    parser.add_argument("--max_new_tokens", type=int, default=1, help="Legacy decode bound; step action decoding uses --step_action_max_new_tokens.")
     parser.add_argument("--baseline_beta", type=float, default=0.9)
     parser.add_argument("--use_running_baseline", action="store_true")
     parser.add_argument(
         "--rl_algo",
         type=str,
         default="grpo_episode",
-        choices=["grpo_episode", "reinforce", "grpo", "grpo_manual", "bopo"],
+        choices=["grpo_episode", "unsloth_grpo", "reinforce", "grpo", "grpo_manual", "bopo"],
     )
     parser.add_argument("--group_size", type=int, default=4, help="Number of sampled rollouts per prompt (GRPO).")
-    parser.add_argument("--grpo_epochs", type=int, default=1, help="Number of optimization epochs per GRPO batch.")
+    parser.add_argument("--grpo_epochs", type=int, default=2, help="Number of optimization epochs per GRPO batch.")
     parser.add_argument("--grpo_update_batch_size", type=int, default=1, help="Micro-batch size for manual whole-episode GRPO updates.")
     parser.add_argument("--clip_epsilon", type=float, default=0.2, help="PPO/GRPO clip epsilon.")
     parser.add_argument("--kl_coef", type=float, default=0.0, help="Approx-KL regularization coefficient.")
@@ -2394,10 +2356,6 @@ def build_arg_parser():
     parser.add_argument("--bopo_pair_mode", type=str, default="divergent_suffix", choices=["aligned", "shared_prefix", "divergent_suffix"], help="BOPO pair construction mode.")
     parser.add_argument("--step_action_max_new_tokens", type=int, default=1, help="Max decode length for one step action.")
     parser.add_argument("--env_mode", type=str, required=True, choices=["serial", "dispatch"], help="Step environment mode used during rollout.")
-    parser.add_argument("--policy_head_type", type=str, default="candidate_scoring", choices=["candidate_scoring"], help="Policy head type. RL now uses candidate-scoring reranker.")
-    parser.add_argument("--candidate_score_token", type=str, default=CANDIDATE_SCORE_TOKEN_DEFAULT, help="Marker token used by candidate score head.")
-    parser.add_argument("--candidate_scoring_query_forward_batch_size", type=int, default=1, help="Micro-batch size for candidate query scoring during RL rollouts/updates.")
-    parser.add_argument("--print_candidate_probs_during_rl", action="store_true", help="Print candidate probability traces during RL rollouts when feasible_count > 1.")
     parser.add_argument("--action_code_width", type=int, default=4, help="Fixed digit width in action token (e.g., <A0001>).")
     parser.add_argument("--action_code_seed", type=int, default=42, help="Base seed for randomized action-code mapping.")
     parser.add_argument("--action_code_cap", type=int, default=9999, help="Upper bound of action token pool (sampled sparsely per step from [1, cap]).")
@@ -2409,7 +2367,7 @@ def build_arg_parser():
         "--invalid_makespan_penalty",
         type=float,
         default=1e6,
-        help="Penalty makespan used for invalid rollouts.",
+        help="Penalty makespan used for infeasible outputs in legacy manual RL.",
     )
     parser.add_argument(
         "--reward_mode",
@@ -2424,11 +2382,7 @@ def build_arg_parser():
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
-    parser.add_argument("--dataset_path", type=str, default=None, help="Optional explicit raw-problem dataset path.")
-    parser.add_argument("--dataset_source", type=str, default="local", choices=["hf", "local"], help="Source for raw RL problem dataset.")
-    parser.add_argument("--dataset_hf_repo", type=str, default="HYUNJINI/jssp_raw_source_v1")
-    parser.add_argument("--dataset_hf_file", type=str, default="llm_jssp/train.json")
-    parser.add_argument("--dataset_local_path", type=str, default="llm_jssp/train.json")
+    parser.add_argument("--dataset_path", type=str, default="llm_jssp/train.json", help="Legacy manual RL raw-problem dataset path.")
     parser.add_argument("--rl_num_jobs", type=int, default=None)
     parser.add_argument("--rl_num_machines", type=int, default=None)
     parser.add_argument("--min_rl_num_jobs", type=int, default=None)
@@ -2440,12 +2394,41 @@ def build_arg_parser():
     parser.add_argument("--random_time_low", type=int, default=1)
     parser.add_argument("--random_time_high", type=int, default=100)
 
+    parser.add_argument("--grpo_dataset_source", type=str, default="hf", choices=["hf", "local"])
+    parser.add_argument("--grpo_dataset_path", type=str, default=None)
+    parser.add_argument("--grpo_dataset_role", type=str, default="policy")
+    parser.add_argument("--grpo_step_dataset_hf_repo", type=str, default="HYUNJINI/jssp_policy_step_train_all_v1")
+    parser.add_argument("--grpo_step_dataset_hf_file", type=str, default="train_data/jssp_step_train_policy.jsonl")
+    parser.add_argument("--grpo_step_dataset_local_path", type=str, default="/content/jssp_step_train_policy.jsonl")
+    parser.add_argument("--grpo_step_dataset_hf_repo_dispatch", type=str, default="HYUNJINI/jssp_policy_step_train_dispatch_v1")
+    parser.add_argument("--grpo_step_dataset_hf_file_dispatch", type=str, default="train_data/jssp_step_train_policy_dispatch.jsonl")
+    parser.add_argument("--grpo_step_dataset_local_path_dispatch", type=str, default="/content/jssp_step_train_policy_dispatch.jsonl")
+    parser.add_argument("--grpo_max_dataset_rows", type=int, default=5000)
+    parser.add_argument("--grpo_min_feasible_actions", type=int, default=2)
+    parser.add_argument("--grpo_shuffle_seed", type=int, default=42)
+    parser.add_argument("--grpo_per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--grpo_gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--grpo_num_generations", type=int, default=6)
+    parser.add_argument("--grpo_num_train_epochs", type=float, default=None)
+    parser.add_argument("--grpo_max_steps", type=int, default=-1)
+    parser.add_argument("--grpo_logging_steps", type=int, default=5)
+    parser.add_argument("--grpo_save_steps", type=int, default=100)
+    parser.add_argument("--grpo_max_prompt_length", type=int, default=4096)
+    parser.add_argument("--grpo_max_completion_length", type=int, default=8)
+    parser.add_argument("--grpo_report_to", type=str, default="none")
+    parser.add_argument("--grpo_use_fast_inference", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--grpo_gpu_memory_utilization", type=float, default=0.6)
+    parser.add_argument("--grpo_reward_valid_weight", type=float, default=1.0)
+    parser.add_argument("--grpo_reward_proxy_weight", type=float, default=1.0)
+    parser.add_argument("--grpo_reward_teacher_weight", type=float, default=0.25)
+    parser.add_argument("--grpo_optim", type=str, default="adamw_8bit")
+    parser.add_argument("--grpo_weight_decay", type=float, default=0.01)
+    parser.add_argument("--grpo_warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--grpo_lr_scheduler_type", type=str, default="linear")
+    parser.add_argument("--grpo_max_grad_norm", type=float, default=1.0)
+
     parser.add_argument("--seed", type=int, default=42)
-    return parser
-
-
-def parse_args(argv=None):
-    return build_arg_parser().parse_args(argv)
+    return parser.parse_args()
 
 
 def main():

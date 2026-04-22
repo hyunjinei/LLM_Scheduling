@@ -1,0 +1,105 @@
+# Colab toy demo: candidate scoring hidden vector
+# 3 candidates, one step, tiny backbone, Linear score head, CE update.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(7)
+
+SCORE_TOKEN = "<CAND_SCORE>"
+
+candidates = [
+    "<A1023> -> Job 0 | M0 | p=5 | cmax 10->15",
+    "<A7741> -> Job 1 | M1 | p=2 | cmax 10->12",
+    "<A0390> -> Job 2 | M2 | p=9 | cmax 10->19",
+]
+target_candidate_index = torch.tensor([1])
+
+queries = [
+    "State: three jobs are feasible.\n"
+    "Candidates:\n"
+    + "\n".join(candidates)
+    + "\nCandidate under evaluation: "
+    + cand
+    + f"\n{SCORE_TOKEN}"
+    for cand in candidates
+]
+
+tokens = sorted(set(" ".join(queries).replace("\n", " ").split()))
+stoi = {tok: i for i, tok in enumerate(tokens)}
+score_token_id = stoi[SCORE_TOKEN]
+
+encoded = []
+score_positions = []
+for q in queries:
+    ids = [stoi[tok] for tok in q.replace("\n", " ").split()]
+    encoded.append(ids)
+    score_positions.append(ids.index(score_token_id))
+
+max_len = max(len(x) for x in encoded)
+input_ids = torch.zeros((len(encoded), max_len), dtype=torch.long)
+attention_mask = torch.zeros_like(input_ids)
+for row, ids in enumerate(encoded):
+    input_ids[row, : len(ids)] = torch.tensor(ids)
+    attention_mask[row, : len(ids)] = 1
+score_positions = torch.tensor(score_positions)
+
+
+class TinyBackbone(nn.Module):
+    def __init__(self, vocab_size, hidden_size):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.encoder = nn.GRU(hidden_size, hidden_size, batch_first=True)
+
+    def forward(self, input_ids):
+        x = self.embedding(input_ids)
+        h, _ = self.encoder(x)
+        return h
+
+
+hidden_size = 8
+backbone = TinyBackbone(len(stoi), hidden_size)
+candidate_score_head = nn.Linear(hidden_size, 1)
+optimizer = torch.optim.AdamW(
+    list(backbone.parameters()) + list(candidate_score_head.parameters()),
+    lr=1e-2,
+)
+
+
+def forward_scores():
+    hidden_states = backbone(input_ids)
+    row_idx = torch.arange(input_ids.shape[0])
+    score_hidden_vectors = hidden_states[row_idx, score_positions]
+    scores = candidate_score_head(score_hidden_vectors).squeeze(-1)
+    return score_hidden_vectors, scores
+
+
+score_hidden_vectors, scores = forward_scores()
+probs = torch.softmax(scores, dim=-1)
+loss = F.cross_entropy(scores.unsqueeze(0), target_candidate_index)
+
+print("Hidden vector at <CAND_SCORE> for each candidate:")
+for i, h in enumerate(score_hidden_vectors):
+    print(i, [round(float(x), 4) for x in h.detach()])
+
+print("scores before:", [round(float(x), 4) for x in scores.detach()])
+print("probs before:", [round(float(x), 4) for x in probs.detach()])
+print("loss before:", round(float(loss.detach()), 4))
+
+old_head_weight = candidate_score_head.weight.detach().clone()
+old_head_bias = candidate_score_head.bias.detach().clone()
+
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()
+
+_, new_scores = forward_scores()
+new_probs = torch.softmax(new_scores, dim=-1)
+new_loss = F.cross_entropy(new_scores.unsqueeze(0), target_candidate_index)
+
+print("scores after:", [round(float(x), 4) for x in new_scores.detach()])
+print("probs after:", [round(float(x), 4) for x in new_probs.detach()])
+print("loss after:", round(float(new_loss.detach()), 4))
+print("head weight L2 delta:", torch.norm(candidate_score_head.weight.detach() - old_head_weight).item())
+print("head bias L2 delta:", torch.norm(candidate_score_head.bias.detach() - old_head_bias).item())

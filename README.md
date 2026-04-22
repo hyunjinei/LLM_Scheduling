@@ -1,5 +1,18 @@
 # LLM_JSSP_masking
 
+## Canonical 실행 경로
+
+현재 표준 구현은 **`[action_code_add][fix]` action-code candidate-scoring 방식**이다.
+
+- SFT 학습: `notebooks/[action_code_add][fix]colab_02_train_step_lora_full.ipynb`
+- 추론/평가: `notebooks/[action_code_add][fix]colab_03_inference_step_full.ipynb`
+- RL: `notebooks/[action_code_add][fix]colab_05_rl_full.ipynb`
+- Python SFT 진입점: `unified_trainer.py`
+- Python inference 진입점: `inference_jssp_fssp.py`
+- Python RL 진입점: `RL_jssp_fssp.py`
+
+정책은 action token을 직접 생성해 고르는 구조가 아니라, 각 feasible candidate를 `<CAND_SCORE>` 위치 hidden vector로 점수화한 뒤 `candidate_score_head`로 rerank한다. 구버전 generation 기반 파일과 예전 노트북 변형은 `legacy/` 아래에 보관했다.
+
 ## 연구 개요
 
 이 저장소는 **Job Shop Scheduling Problem (JSSP)** 를 **step-by-step LLM policy** 로 푸는 연구 코드다. 핵심 아이디어는 매 step마다 LLM이 자연어 상태를 보고 다음 행동을 선택하되, **디코딩 시점에 feasible action만 남기고 나머지 행동은 마스킹**하는 것이다. 즉, 제약을 어긴 뒤 사후 repair 하거나 sampling으로 운 좋게 feasible 해를 찾는 방식이 아니라, **행동 생성 단계 자체를 제약 친화적으로 바꾸는 것**이 목적이다.

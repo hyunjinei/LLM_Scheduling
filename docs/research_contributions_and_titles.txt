@@ -1,0 +1,114 @@
+Research Contributions and Title Drafts
+
+Recommended Paper Title
+
+Korean:
+실행 가능 행동 마스킹과 정책 개선을 결합한 Step-by-Step LLM 기반 Job Shop Scheduling Framework
+
+English:
+A Step-by-Step LLM Framework for Job Shop Scheduling with Feasible Action Masking and Policy Improvement
+
+
+Alternative Title Options
+
+Korean:
+1. 강화학습과 자기반성을 결합한 Step-by-Step LLM 기반 Job Shop Scheduling Framework
+2. 실행 가능 행동 마스킹 기반 Step-by-Step LLM Job Shop Scheduling Framework
+3. 정책 개선 중심 Step-by-Step LLM Job Shop Scheduling Framework
+4. Whole-Schedule Generation을 넘어선 Step-by-Step LLM Job Shop Scheduling Framework
+
+English:
+1. A Step-by-Step LLM Framework for Job Shop Scheduling via Feasible Action Masking, Reinforcement Learning, and Self-Reflection
+2. A Step-by-Step LLM Framework for Job Shop Scheduling with Feasible Action Masking
+3. A Policy-Improvement-Oriented Step-by-Step LLM Framework for Job Shop Scheduling
+4. Beyond Whole-Schedule Generation: A Step-by-Step LLM Framework for Job Shop Scheduling
+
+
+Title Selection Guide
+
+- If you want the cleanest and safest title:
+  Korean: 실행 가능 행동 마스킹과 정책 개선을 결합한 Step-by-Step LLM 기반 Job Shop Scheduling Framework
+  English: A Step-by-Step LLM Framework for Job Shop Scheduling with Feasible Action Masking and Policy Improvement
+
+- If you want RL and self-reflection to be explicitly visible in the title:
+  Korean: 강화학습과 자기반성을 결합한 Step-by-Step LLM 기반 Job Shop Scheduling Framework
+  English: A Step-by-Step LLM Framework for Job Shop Scheduling via Feasible Action Masking, Reinforcement Learning, and Self-Reflection
+
+- If you want a shorter title for submission or slides:
+  Korean: Step-by-Step LLM Job Shop Scheduling Framework
+  English: A Step-by-Step LLM Framework for Job Shop Scheduling
+
+
+Detailed Contributions
+
+Korean
+
+Core Contribution
+
+1. 의사결정 방식의 재정의: 기존의 LLM 기반 스케줄링 연구가 전체 해 시퀀스를 한 번에 생성하는 방식에 주로 의존했던 것과 달리, 본 연구는 JSSP를 현재 상태를 바탕으로 다음 행동을 순차적으로 선택하는 step-by-step action selection 문제로 재정의한다. 각 step에서 모델은 현재 scheduling state, 현재 feasible action set, 그리고 후보 action의 전이 정보를 입력으로 받아 정확히 하나의 다음 행동을 선택하며, 이러한 정식화는 전체 스케줄을 한 번에 생성하는 방식보다 실제 스케줄링 의사결정 구조에 더 가깝고 상태 의존적인 순차 의사결정을 보다 직접적으로 학습할 수 있게 한다.
+
+2. 실행 가능성 제어: 본 연구는 환경으로부터 매 step 계산된 feasible action set으로 모델의 출력을 제한하는 decode-time feasible-action masking을 도입한다. 이를 통해 모델링된 action space와 환경 제약 내부에서 실행 불가능한 행동이 생성 단계에서 직접 차단되도록 설계하며, feasibility를 사후 filtering이나 repair에만 의존하지 않고 행동 생성 단계에서 통제한다. 이 방식은 실행 가능성을 학습 보상, 샘플링, 사후 보정에 주로 의존하는 기존 접근과 구별된다.
+
+3. 출력 편향 완화: 절대 job index 대신 step-local randomized action code <Axxxx>를 사용하여, 모델이 특정 작업 번호나 고정된 출력 패턴에 과도하게 의존하는 현상을 줄이도록 한다. 각 step에서 feasible action들은 무작위 코드로 다시 매핑되고, 모델은 절대 인덱스가 아니라 현재 후보들 중 하나의 code를 선택한다. 선택된 code는 이후 실제 job으로 역매핑되어 환경에 적용되며, 이를 통해 모델이 절대 인덱스보다 상태와 후보 특성에 기반한 action selection policy를 학습하도록 유도하고 학습 범위를 벗어난 문제 크기에 대해서도 보다 안정적인 일반화 가능성을 기대할 수 있다.
+
+4. 목적 함수 지향 상태 표현: 단순한 제약 만족을 넘어서 makespan 최소화와 같은 목적 함수를 반영하기 위해, 각 후보 action의 전이 특성을 포함한 자연어 상태 표현을 구성한다. 현재 action의 machine, processing time, projected makespan change, remaining work, post-route 등의 step-level 정보를 prompt에 포함시켜, LLM이 단순히 실행 가능성만이 아니라 목적 함수 지향적인 의사결정을 학습할 수 있도록 한다.
+
+5. 정책 학습과 개선 메커니즘의 결합: 본 연구는 step-wise policy prediction을 중심으로, 선택 근거를 설명하는 reason supervision과 완성된 스케줄을 사후적으로 검토하여 비효율적 선택이 발생한 의사결정 단계를 다시 선택하는 self-reflection prompting을 결합한다. 또한 teacher schedule로부터 상태-행동 쌍을 추출한 step-wise supervision dataset을 기반으로 LoRA fine-tuning을 수행하고, reinforcement learning을 통해 makespan 중심의 정책 개선으로 확장할 수 있도록 구성한다.
+
+
+English
+
+Core Contribution
+
+1. Reformulating JSSP as a step-wise action selection problem: Instead of asking the language model to generate an entire schedule sequence in a single autoregressive pass, this work reformulates the Job Shop Scheduling Problem (JSSP) as a step-by-step action selection problem. At each decision step, the model receives the current scheduling state, the currently feasible action set, and candidate transition information, and then selects exactly one next action. This formulation is closer to the actual structure of sequential scheduling decisions and allows the model to learn state-conditioned decision making more directly than whole-schedule generation.
+
+2. Controlling feasibility through decode-time feasible-action masking: The proposed framework introduces decode-time feasible-action masking, which restricts model generation to the feasible action set computed by the environment at each step. As a result, infeasible actions within the modeled action space and environment constraints are blocked at generation time rather than handled only through post-hoc filtering or repair. This distinguishes the proposed method from prior approaches that improve feasibility mainly through reward design, sampling, or post-processing.
+
+3. Reducing output bias through randomized action codes: Instead of directly generating absolute job indices, the framework uses step-local randomized action codes of the form <Axxxx>. At each step, feasible actions are remapped to randomized codes, and the model selects one code rather than a fixed job identity. The selected code is then mapped back to the corresponding job and applied to the environment. This design reduces dependence on absolute output identities and encourages the model to learn a policy based on the current state and candidate features. It also provides a more plausible path toward stable generalization beyond the training-scale problem sizes.
+
+4. Objective-aware prompting through candidate transition features: To go beyond feasibility and better align the model with makespan minimization, the framework constructs natural-language state descriptions that include candidate transition features. These features include operation machine, processing time, projected makespan change, remaining work, and post-route information. This representation enables the model to make decisions that reflect not only constraint satisfaction but also the scheduling objective.
+
+5. Combining policy learning and policy improvement mechanisms: The framework combines step-wise policy prediction with reason supervision and self-reflection prompting, where completed schedules are analyzed afterward so that inefficient decisions can be revisited at critical steps. During training, LoRA-based fine-tuning is performed on a step-wise supervision dataset constructed from teacher schedule state-action pairs, and the framework can be further extended with reinforcement learning for makespan-oriented policy improvement.
+
+
+Short Contribution Summary for PPT
+
+Korean:
+1. JSSP를 whole-schedule generation이 아닌 step-wise action selection 문제로 재정의
+2. Decode-time feasible-action masking으로 실행 불가능한 행동 생성을 생성 단계에서 직접 차단
+3. Randomized action code로 absolute-index bias를 완화하고 상태 기반 정책 학습 유도
+4. Candidate transition feature 기반 상태 표현으로 makespan-aware decision making 지원
+5. LoRA fine-tuning, reinforcement learning, self-reflection을 통해 정책 학습과 개선 수행
+
+English:
+1. Reformulate JSSP as a step-wise action selection problem rather than whole-schedule generation
+2. Block infeasible actions at decoding time through feasible-action masking
+3. Reduce absolute-index bias through randomized action codes
+4. Support makespan-aware decision making with candidate transition features
+5. Combine LoRA fine-tuning, reinforcement learning, and self-reflection for policy learning and improvement
+
+
+Short Contribution Summary for Paper
+
+Korean:
+본 연구의 핵심 방법론적 기여는 세 가지이다. 첫째, JSSP를 whole-schedule generation이 아닌 step-wise action selection 문제로 재정의한다. 둘째, feasible action set에 대한 decode-time masking을 통해 모델링된 action space 내부에서 실행 불가능한 행동 생성을 생성 단계에서 직접 차단한다. 셋째, randomized action code를 도입하여 absolute-index bias를 완화하고 상태 기반 정책 학습을 유도한다. 나아가 본 프레임워크는 candidate transition feature 기반 상태 표현, LoRA fine-tuning, reinforcement learning, self-reflection prompting을 통해 정책 학습과 개선 메커니즘을 확장한다.
+
+English:
+This work makes three primary methodological contributions. First, it reformulates JSSP as a step-wise action selection problem rather than a whole-schedule generation task. Second, it enforces feasibility through decode-time masking over the feasible action set, directly blocking infeasible action generation inside the modeled action space. Third, it introduces randomized action codes to reduce absolute-index bias and promote state-based policy learning. On top of this formulation, the framework further incorporates candidate transition features, LoRA fine-tuning, reinforcement learning, and self-reflection prompting as policy learning and improvement mechanisms.
+
+
+Safe Claim Boundary
+
+Korean:
+- 본 프레임워크는 masked feasible decoding을 사용하는 step-wise action selection 구조를 중심으로 설계되었다.
+- 실행 가능성은 모델링된 action space와 환경 제약 내부에서 통제된다.
+- Randomized action code는 absolute-index dependence를 줄이고 상태 기반 정책 학습을 유도하기 위한 설계이다.
+- RL과 self-reflection은 step-wise masked policy 위에서 동작하는 정책 개선 메커니즘으로 사용된다.
+- 모든 scheduling formulation에 대한 보편적 우수성을 주장하기보다는, 현재 설정에서의 방법론적 장점에 초점을 맞추는 것이 안전하다.
+
+English:
+- The framework is centered on step-wise action selection with masked feasible decoding.
+- Feasibility is controlled within the modeled action space and environment constraints.
+- Randomized action codes are intended to reduce absolute-index dependence and encourage state-based policy learning.
+- RL and self-reflection are used as policy-improvement mechanisms on top of the step-wise masked policy.
+- It is safer to emphasize the methodological advantages under the current setting rather than claim universal superiority across all scheduling formulations.
